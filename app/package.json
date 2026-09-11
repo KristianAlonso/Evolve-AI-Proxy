@@ -1,0 +1,24 @@
+{
+  "name": "evolve-ai-proxy",
+  "version": "0.1.0",
+  "description": "Agent loop proxy for local and small AI models (OpenAI-compatible endpoint).",
+  "license": "Apache-2.0",
+  "main": "dist/index.js",
+  "type": "module",
+  "scripts": {
+    "build": "tsc --noEmit",
+    "dev": "tsx watch --no-cache src/index.ts",
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "@ai-sdk/openai-compatible": "^3.0.47",
+    "@sinclair/typebox": "0.34.52",
+    "fastify": "^4.26.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "tsx": "^4.0.0",
+    "typescript": "^5.4.0",
+    "vitest": "^2.0.0"
+  }
+}

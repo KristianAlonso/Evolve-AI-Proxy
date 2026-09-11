@@ -1,0 +1,88 @@
+# =====================
+# Node.js / pnpm
+# =====================
+node_modules/
+.pnp.*
+pnp.ts
+
+# Lock files (keep pnpm-lock.yaml, ignore others)
+package-lock.json
+yarn.lock
+yarn-error.log
+npm-debug.log*
+pnpm-debug.log*
+
+# Build output
+dist/
+build/
+*.tsbuildinfo
+
+# TypeScript compilation artifacts
+*.tsbuildinfo
+out/
+
+# =====================
+# Environment files
+# =====================
+.env
+.env.*
+!.env.example
+!.env.template
+
+# Local overrides
+.env.local
+.env.development.local
+.env.test.local
+.env.production.local
+
+# =====================
+# IDE & Editor
+# =====================
+.vscode/*
+!.vscode/extensions.json
+!.vscode/settings.json
+!.vscode/tasks.json
+!.vscode/launch.json
+.idea/
+*.swp
+*.swo
+*~
+.project
+.classpath
+.settings/
+
+# =====================
+# OS
+# =====================
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+# =====================
+# Logs & Data
+# =====================
+logs/
+*.log
+nyc_coverage/
+.lintstagedrc.js
+
+# Testing coverage
+coverage/
+.nyc_output/
+*.lcov
+
+# TypeORM / SQLite (if used)
+*.db
+*.sqlite
+*.sqlite3
+
+# TypeScript cache
+tsconfig.tsbuildinfo
+node/.cache
+
+# =====================
+# Misc
+# =====================
+.cache/
+.tmp/
+temp/
