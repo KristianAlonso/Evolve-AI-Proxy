@@ -1,1 +1,11 @@
-{}
+{
+  "$schema": "https://unpkg.com/opencode-swarm/opencode-swarm.schema.json",
+  "execution_mode": "balanced",
+  "hooks": {
+    "compaction": true,
+    "agent_activity": true,
+    "delegation_gate": true,
+    "delegation_tracker": true,
+    "system_enhancer": true
+  }
+}
