@@ -137,10 +137,21 @@ Wire 100% `chat.completion.chunk` (reasoning/thinking + content + tool_calls + f
 - Run #5 (un solo tipo + failover): mapeo `tool="task" type="default" available=[default]` (un único tipo validado como existente + lista de candidatos para failover). El cliente (opencode-swarm) **acepta** el tipo (muestra **Default Agent**). Con un solo tipo mapeado no hay rotación (re-emisión estable `retries=N/3`); la rotación de tipo (`SPAWN_RETRY_THRESHOLD=3` → siguiente tipo con `agent_id` nuevo, pinned al funcionar) está cubierta por tests unitarios del orquestador.
 - **Limitación de entorno (no del proxy)**: el plugin `opencode-swarm` intercepta la herramienta `task` con contratos propios (campo `ACCEPTANCE:`, knowledge-gate) y reescribe el prompt del subagente (se pierde el envelope), así que el happy path completo de subagentes no puede completarse con ese plugin. El contrato del proxy (wire, mapeo, spawn, resume, re-emisión, abort) quedó verificado.
 
+### Run #10–#11 — Causa raíz del `default` type y happy path completo (2026-09-12)
+
+**Run #10 (`--pure`, sin plugins, 89 tools):** mapeo `tool="task" type="default" available=[default]` → el cliente rechaza en runtime: `Unknown agent type: default is not a valid agent type`. **Causa raíz:** con `--pure` la herramienta integrada `task` de opencode expone `subagent_type` **free-form** (sin enum) y lista los 9 types válidos (architect, coder, critic, designer, docs, explorer, reviewer, sme, test_engineer) al **final** de la descripción de la herramienta. El formato compacto del mapeador truncaba descripciones a 300 chars → el modelo nunca veía la lista → caía en el fallback `default` del prompt → el cliente lo rechazaba → el subagente nunca corría → re-emisión estable sin producto (fail-safe correcto, pero improductivo).
+
+**Fixes (verificados en run #11):**
+1. `subagent-mapper.ts`: herramientas **spawn-like** (nombre matchea `/task|spawn|subagent|agent|delegate|worker|launch/i`) conservan la descripción completa (cap 4000 chars) para que la lista de types sea visible; el resto sigue en 300. Test unitario cubre ambos casos.
+2. `routes.ts`: `bodyLimit` Fastify 1 MB → **16 MB** (clientes gordinflones con 89–218 tool schemas enviaban cuerpos de ~1 MB → 413 intermitentes `Request body is too large`).
+
+**Run #11 (happy path completo, `--pure`, 89 tools, `llama_cpp/default`):** mapeo `tool="task" type="sme" available=[sme,architect,explorer,coder,designer,docs,reviewer,critic,test_engineer]` — los 9 types reales enumerados y uno válido elegido. El cliente **ejecuta de verdad** los subagentes: `planify (round 1) ✓` → `execute (round 1) ✓` → `evaluate (round 1) ✓` (cada fase ~48 s de LLM real a través del proxy) → `orchestrator done: decision=complete round=1 upstream_calls=5` → respuesta final devuelta a opencode. **El happy path FASE 6 quedó verificado end-to-end con cliente real.**
+
 ### Pendiente (baja prioridad)
 
 - ~~Bug de `readTraceId()`~~ **resuelto**: ahora es request-scoped.
-- (Opcional) Cliente sin el plugin `opencode-swarm` para verificar el happy path completo de subagentes end-to-end; el contrato del proxy ya está verificado.
+- ~~(Opcional) Happy path completo sin `opencode-swarm`~~ **resuelto** en el run #11.
+- (Opcional) Con el plugin swarm el happy path sigue bloqueado en el knowledge-gate del plugin (limitación de entorno, no del proxy).
 
 ## FASE 6.5 — Detección de drift de la lista de tipos (2026-09-12)
 

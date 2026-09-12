@@ -172,7 +172,10 @@ export interface CreateAppOptions {
 
 /** Build and fully configure the Fastify server (routes + validation hook, NO listen). */
 export async function createApp(options: CreateAppOptions = {}): Promise<FastifyInstance> {
-  const app = makeFastify({ logger: false });
+  // Fat clients (opencode with 100-200+ tool schemas) send multi-MB request bodies; Fastify's
+  // 1MB default turns them into intermittent 413s mid-session. 16MB leaves headroom for the
+  // biggest observed clients (~1MB per request) plus long conversations.
+  const app = makeFastify({ logger: false, bodyLimit: 16 * 1024 * 1024 });
   logger.info('evolve_ai_proxy routes registered');
 
   // ---- /health ----

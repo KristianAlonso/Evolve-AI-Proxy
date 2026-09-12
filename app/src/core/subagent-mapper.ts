@@ -81,9 +81,15 @@ export async function mapSubagentTool(
         const enumVals = Array.isArray(schema?.enum) ? `[enum: ${schema.enum.map((v) => String(v)).join(' | ')}]` : '';
         args[key] = [desc, enumVals].filter(Boolean).join(' ');
       }
+      // Spawn-like tools (task/spawn/subagent/agent/...) often list their valid subagent types in a
+      // LONG description tail (e.g. opencode's built-in task tool: "Available agent types: ..."),
+      // which a blind 300-char truncation would hide — then the model falls back to inventing
+      // "default" and the client rejects it at runtime. Keep those descriptions (capped) intact.
+      const spawnLike = /task|spawn|subagent|agent|delegate|worker|launch/i.test(t.function.name);
+      const descCap = spawnLike ? 4000 : 300;
       return JSON.stringify({
         name: t.function.name,
-        description: (t.function.description ?? '').slice(0, 300).replace(/\s+/g, ' '),
+        description: (t.function.description ?? '').slice(0, descCap).replace(/\s+/g, ' '),
         arguments: args,
       });
     })

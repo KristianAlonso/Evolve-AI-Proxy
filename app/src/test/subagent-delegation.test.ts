@@ -270,6 +270,50 @@ describe('subagent tool mapper', () => {
     expect(await mapSubagentTool(garbageProvider, [SPAWN_TOOL], { model: 'm', logger: log })).toBeNull();
     expect(garbageProvider.calls.length).toBe(2);
   });
+
+  it('keeps spawn-like tools\' full descriptions (the type list lives in the long description tail)', async () => {
+    // Real-world case (opencode built-in task tool): subagent_type is FREE-FORM and the valid types
+    // are listed at the END of the tool description. A blind 300-char truncation hides the list,
+    // the model falls back to inventing "default", and the client rejects it at runtime.
+    const longDesc =
+      'Launch a new agent to handle complex, multistep tasks autonomously. '.repeat(20) +
+      'Available agent types: architect, coder, critic, designer, docs, explorer, reviewer, sme, test_engineer';
+    const spawnToolWithLongDesc: ToolDefinition = {
+      type: 'function',
+      function: {
+        name: 'task',
+        description: longDesc,
+        parameters: {
+          type: 'object',
+          properties: {
+            description: { type: 'string' },
+            subagent_type: { type: 'string' },
+            prompt: { type: 'string' },
+          },
+        },
+      },
+    };
+    const provider = withMapping(stub(), VALID_SPEC_JSON);
+    await mapSubagentTool(provider, [spawnToolWithLongDesc], { model: 'm', logger: log });
+    const mappingCall = provider.calls.find((c) => c.messages.some((m) => (m.content ?? '').includes('tool mapper')));
+    const userMsg = mappingCall?.messages.find((m) => m.role === 'user');
+    expect(userMsg?.content).toContain('Available agent types: architect, coder, critic');
+
+    // Non-spawn tools stay truncated (300 chars) to keep the mapping prompt small.
+    const otherLong: ToolDefinition = {
+      type: 'function',
+      function: {
+        name: 'bash',
+        description: 'x'.repeat(400),
+        parameters: { type: 'object', properties: { command: { type: 'string' } } },
+      },
+    };
+    const p2 = withMapping(stub(), VALID_SPEC_JSON);
+    await mapSubagentTool(p2, [spawnToolWithLongDesc, otherLong], { model: 'm', logger: log });
+    const call2 = p2.calls.find((c) => c.messages.some((m) => (m.content ?? '').includes('tool mapper')));
+    const user2 = call2?.messages.find((m) => m.role === 'user');
+    expect(user2?.content?.includes('x'.repeat(301))).toBe(false);
+  });
 });
 
 /** Wrap a stub provider so the tool-mapper prompt gets a canned answer. */
