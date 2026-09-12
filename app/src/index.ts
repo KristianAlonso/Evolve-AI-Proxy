@@ -19,10 +19,24 @@ export async function main(provider?: ChatProvider): Promise<void> {
   try {
     await app.listen({ port: env.HTTP_PORT, host: env.HTTP_HOST });
   } catch (err) {
-    // On address-in-use the server is already listening; retry once for fast re-invocation.
     const maybeEADDRINUSE = String(err).includes('EADDRINUSE');
-    await app.ready();
-    if (!maybeEADDRINUSE) throw err;
+    await app.ready(); // release resources either way
+    if (maybeEADDRINUSE) {
+      // A different process owns the port. It is the one serving requests — and the only one
+      // whose console shows incoming-connection logs. Saying "listening" here (the old
+      // behaviour) made new instances look healthy while silently logging nothing, so fail
+      // loudly instead: the user must stop the other instance (usually a stale background
+      // dev proxy) and start again.
+      console.error(
+        `fatal: port ${env.HTTP_PORT} is already in use by another process. That instance is ` +
+        `the one serving requests, so this console will NOT show incoming-connection logs. ` +
+        `Stop the other process first, e.g. in PowerShell:\n` +
+        `  Get-NetTCPConnection -LocalPort ${env.HTTP_PORT} -State Listen | ` +
+        `  Select-Object -ExpandProperty OwningProcess -Unique | ForEach-Object { Stop-Process -Id $_ -Force }`,
+      );
+      process.exit(1);
+    }
+    throw err;
   }
 
   console.log(`evolve_ai_proxy listening on http://${env.HTTP_HOST}:${env.HTTP_PORT}`);
