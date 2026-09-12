@@ -22,10 +22,18 @@ import { AgentLoop, type FinalResultData, type LoopOptions } from './core/agent-
 import { OpenAICompatibleProvider } from './provider/openai-compatible-provider.js';
 import type { ChatProvider, UpstreamModel } from './provider/types.js';
 import type { LoopSink } from './core/agent-loop.js';
+import { SessionStore } from './core/session-store.js';
 import { SseWriter } from './sse-writer.js';
-import type { ProxyRequest, UpstreamMessage } from './types.js';
+import type { ProxyRequest, ToolCall, UpstreamMessage } from './types.js';
 import type { LoopDecision } from './types.js';
 import env from './config.js';
+
+/**
+ * One shared in-memory store for in-flight tool-delegation sessions (FASE 2). The whole
+ * conversation travels in every request's `messages`, so the store only holds the small
+ * pending-tool-call state; it is injectable via `CreateAppOptions.sessionStore` for tests.
+ */
+const defaultSessionStore = new SessionStore();
 
 const logger = createLogger('http');
 
@@ -38,6 +46,9 @@ function finishReason(decision: LoopDecision): { reason: string; refused: boolea
       return { reason: 'length', refused: false };
     case 'refusal_exhausted':
       return { reason: 'stop', refused: true };
+    // FASE 2: the client executes the delegated tools and resumes the conversation.
+    case 'tool_calls_pending':
+      return { reason: 'tool_calls', refused: false };
     default:
       return { reason: 'error', refused: true };
   }
@@ -54,7 +65,11 @@ function toOpenAICompletion(model: string, finalResult: FinalResultData): Record
     choices: [
       {
         index: 0,
-        message: { role: 'assistant', content: finalResult.final_output || '', tool_calls: [] },
+        message: {
+          role: 'assistant',
+          content: finalResult.decision === 'tool_calls_pending' ? null : finalResult.final_output || '',
+          tool_calls: finalResult.tool_calls,
+        },
         finish_reason: reason,
       },
     ],
@@ -97,6 +112,11 @@ class SinkAdapter implements LoopSink {
     this.writer.emitAiContent(iteration, text);
   }
 
+  emitToolCalls(calls: ToolCall[]): void {
+    // FASE 2: delegate the upstream's tool calls to the client as OpenAI streaming chunks.
+    this.writer.emitAiToolCalls(calls);
+  }
+
   writeEvent(_event: Parameters<SseWriter['writeEvent']>[0], _data: Record<string, unknown>): void {
     // task_result / context_clear / tool_call_request carry nothing OpenAI clients should render on
     // this single-connection stream; their information already flows as reasoning/content deltas.
@@ -120,6 +140,8 @@ export interface CreateAppOptions {
   baseUrl?: string;
   /** Bearer token passed to the upstream (used only when no provider is injected). */
   apiKey?: string;
+  /** Injectable tool-delegation session store (FASE 2) so tests can inspect/seed it. */
+  sessionStore?: SessionStore;
 }
 
 /** Build and fully configure the Fastify server (routes + validation hook, NO listen). */
@@ -171,13 +193,16 @@ export async function createApp(options: CreateAppOptions = {}): Promise<Fastify
 
     const concreteModel = await resolveUpstreamModel(model, await readModelsOnce(provider));
 
-    // Map evolve controls down to orchestrator options.
+    // Map evolve controls down to orchestrator options. `tools`/`tool_choice` carry the client's
+    // delegated tools (FASE 2): only the loop's execute step forwards them to the upstream.
     const loopOpts: LoopOptions = {
       max_rounds: body.max_rounds ?? 10,
       max_retries: body.max_retries ?? 3,
       doom_loop_threshold: body.doom_loop_threshold ?? 4,
       context_window_size: await resolveContextWindow(await readModelsOnce(provider), body),
       model: concreteModel,
+      tools: body.tools,
+      tool_choice: body.tool_choice,
     };
 
     const messages = (body.messages ?? []) as UpstreamMessage[];
@@ -187,16 +212,53 @@ export async function createApp(options: CreateAppOptions = {}): Promise<Fastify
     // loop work runs — we therefore always reach here with an actionable message to act on.
     const instruction = firstText(messages);
 
+    // FASE 2: the bidirectional session rides the standard `x-session-id` header (opencode's
+    // x-goog-session-id style affinity header, captured from the opencode upstream dump).
+    const rawSessionId = request.headers['x-session-id'];
+    const sessionId = typeof rawSessionId === 'string' && rawSessionId.length > 0 ? rawSessionId : undefined;
+    const store = options.sessionStore ?? defaultSessionStore;
+
     if (body.stream) {
-      await handleStream(provider, reply as unknown as FastifyReply, loopOpts, messages, instruction);
+      const finalResult = await handleStream(provider, reply as unknown as FastifyReply, loopOpts, messages, instruction);
+      if (finalResult) toolDelegateBookkeeping(store, sessionId, concreteModel, body, finalResult);
       return; // SseWriter has already written frames + ended the stream.
     } else {
       const finalResult = await runLoop(provider, undefined, loopOpts, messages, instruction);
+      toolDelegateBookkeeping(store, sessionId, concreteModel, body, finalResult);
       reply.send(toOpenAICompletion(concreteModel, finalResult));
     }
   });
 
   return app;
+}
+
+/**
+ * FASE 2 bookkeeping: when the loop paused on delegated tool calls, record the pending state under
+ * the request's session id; on any terminal decision, clear a session that was awaiting a resume.
+ * A resume (assistant tool_calls + tool results re-sent on the same session) needs no explicit
+ * flag — the conversation transcript already carries the exchange.
+ */
+function toolDelegateBookkeeping(
+  store: SessionStore,
+  sessionId: string | undefined,
+  model: string,
+  body: Partial<ProxyRequest>,
+  finalResult: FinalResultData,
+): void {
+  if (!sessionId) return;
+  if (finalResult.decision === 'tool_calls_pending') {
+    store.save({
+      sessionId,
+      model,
+      tools: body.tools,
+      tool_choice: body.tool_choice,
+      pendingToolCalls: finalResult.tool_calls,
+      createdAt: Date.now(),
+      updatedAt: Date.now(),
+    });
+  } else {
+    store.delete(sessionId);
+  }
 }
 
 /** Run the agent loop without a sink (non-stream path). */
@@ -217,9 +279,9 @@ async function handleStream(
   provider: ChatProvider,
   reply: FastifyReply,
   opts: LoopOptions,
-  messages: UpstreamMessage[],
+  messages: UpstreamMessage[] ,
   instruction: string,
-): Promise<void> {
+): Promise<FinalResultData | undefined> {
   const writer = new SseWriter(reply);
   const sink = new SinkAdapter(writer);
   try {
@@ -233,6 +295,7 @@ async function handleStream(
     // own — end() flushes the final bytes and signals EOF to the client (and to `inject()`), which a
     // normal SSE stream does when it finishes. Without this the reply stays pending forever.
     reply.raw.end();
+    return result;
   } catch (err) {
     if (!sink.isDisconnected()) {
       logger.error(`stream error: ${String(err)}`);
@@ -243,6 +306,7 @@ async function handleStream(
       }
     }
   }
+  return undefined;
 }
 
 /** First user/system message text — the natural-language instruction for the loop. */

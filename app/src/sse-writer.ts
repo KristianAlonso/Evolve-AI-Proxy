@@ -3,6 +3,7 @@
 // and surfaces client-disconnect so the orchestrator can abort immediately.
 
 import type { FastifyReply } from 'fastify';
+import type { ToolCall } from './types.js';
 
 /** Event names surfaced to clients (SC-009). */
 export const SSE_EVENTS = {
@@ -167,6 +168,30 @@ export class SseWriter {
     const hasRole = !this.assistantTextStarted;
     this.assistantTextStarted = true;
     this.emitAiChunk({ index: 0, delta: hasRole ? { role: 'assistant', content: text } : { content: text }, finishReason: undefined });
+  }
+
+  /**
+   * Emit delegated tool calls as standard OpenAI streaming chunks (FASE 2): one chunk per tool
+   * call, each carrying the complete `delta.tool_calls` entry (id + function name + full
+   * arguments). Complete — not incremental — entries keep the frames trivially parseable by any
+   * OpenAI-compatible client (opencode / Vercel AI SDK), which finalizes a tool call from them.
+   * The caller follows up with `emitAiFinish('tool_calls')` + [DONE].
+   */
+  public emitAiToolCalls(calls: ToolCall[]): void {
+    calls.forEach((call, index) => {
+      const delta: Record<string, unknown> = {
+        tool_calls: [
+          {
+            index,
+            id: call.id,
+            type: 'function',
+            function: { name: call.function.name, arguments: call.function.arguments },
+          },
+        ],
+      };
+      if (index === 0) delta.role = 'assistant';
+      this.emitAiChunk({ index: 0, delta, finishReason: undefined });
+    });
   }
 
   /** OpenAI-compatible finish chunk: empty delta, `finish_reason` set (SC-018). */

@@ -127,4 +127,28 @@ describe('integration — live upstream (evolve_ai_proxy -> LiteLLM gateway)', (
     expect(frames).toMatch(/"choices":\[/);
     expect(frames.includes('[DONE]')).toBe(true);
   });
+
+  // FASE 1 (real-time reasoning across ALL phases): the client must receive reasoning deltas from
+  // the interpretation/evaluation phases, not only during task execution. The order on the wire is
+  // the proof: the first `delta.reasoning` frame must precede the first assistant `delta.content`
+  // frame, because interpret (and eval) run upstream of any execution output.
+  it('delivers reasoning deltas before any assistant text (live all-phase tracing)', { timeout: 90000 }, async () => {
+    const app = await createApp({ baseUrl: env.UPSTREAM_BASE_URL, apiKey: API_KEY });
+    const res = await app.inject({
+      method: 'POST',
+      url: '/v1/chat/completions',
+      payload: { model: 'llama_cpp/default', messages: [PROMPT], stream: true },
+    });
+
+    expect(res.statusCode).toBe(200);
+    const frames = String(res.payload ?? '');
+
+    const firstReasoning = frames.indexOf('"delta":{"reasoning"');
+    const firstContent = frames.indexOf('"delta":{"role":"assistant","content"');
+
+    expect(firstReasoning).toBeGreaterThanOrEqual(0); // upstream thinking reached the client
+    expect(firstContent).toBeGreaterThanOrEqual(0); // and the assistant answer streamed too
+    expect(firstReasoning).toBeLessThan(firstContent); // thinking first -> early-phase tracing, not one late blob
+    expect(frames.includes('[DONE]')).toBe(true);
+  });
 });

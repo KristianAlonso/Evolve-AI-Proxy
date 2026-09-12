@@ -5,6 +5,7 @@
 
 import type { ChatProvider } from '../provider/types.js';
 import type { NormalizedResult, UpstreamMessage, ToolCall } from '../types.js';
+import { callWithStreaming, type LiveEmitter } from './stream-helper.js';
 
 export interface Interpretation {
   mainObjective: string;
@@ -18,7 +19,8 @@ export async function interpretRequest(
   messages: UpstreamMessage[],
   buildPrompt: (messages: UpstreamMessage[]) => string,
   options?: { model: string | null; max_tokens?: number },
-): Promise<{ interpretation: Interpretation; reasoning: string }> {
+  emitter?: LiveEmitter,
+): Promise<{ interpretation: Interpretation; reasoning: string; streamed: boolean }> {
   const instruction = [
     'You are the interpreter of an agent loop proxy.',
     'Analyze the user request and reply with ONLY a JSON object (no prose).',
@@ -33,16 +35,26 @@ export async function interpretRequest(
     ...messages,
   ];
 
-  const result: NormalizedResult = await provider.complete(
-    options?.model ?? null, // concrete user-selected model — never "auto" (no-auto rule)
-    promptMessages,
-    { max_tokens: options?.max_tokens ?? 512 },
-  );
+  // Single shared call (FASE 1): stream live reasoning deltas when an emitter is attached, and
+  // buffer otherwise. Structured `content` here is internal JSON that gets parsed into a trace below,
+  // so only the thinking path surfaces on the wire — emitting it as assistant text would corrupt the
+  // client's answer reconstruction. When no emitter is present the call stays fully buffered, which is
+  // what every unit test exercises (they pass at most four args).
+  const { result, streamed } = await callWithStreaming({
+    provider,
+    model: options?.model ?? null, // concrete user-selected model — never "auto" (no-auto rule)
+    messages: promptMessages,
+    options: { max_tokens: options?.max_tokens ?? 512 },
+    surfaceDelta: emitter ? (chunk) => {
+      const reasoning = typeof chunk.reasoning === 'string' ? chunk.reasoning : '';
+      if (reasoning !== '') emitter.emitReasoningDelta(0, reasoning);
+    } : undefined,
+  });
   const text = (result.content ?? '').trim() || '{}';
   const parsed = safeJsonParse(text);
   if (!parsed) {
     // Fall back to treating the whole thing as the main objective.
-    return { interpretation: { mainObjective: text, subObjectives: [], resourcesNeeded: [] }, reasoning: result.reasoning };
+    return { interpretation: { mainObjective: text, subObjectives: [], resourcesNeeded: [] }, reasoning: result.reasoning, streamed };
   }
 
   const mainObjective = String(parsed.mainObjective ?? text).slice(0, 500);
@@ -56,6 +68,7 @@ export async function interpretRequest(
   return {
     interpretation: { mainObjective, subObjectives, resourcesNeeded },
     reasoning: result.reasoning,
+    streamed,
   };
 }
 

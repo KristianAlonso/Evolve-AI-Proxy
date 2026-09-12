@@ -8,12 +8,15 @@
 import { createOpenAICompatible } from '@ai-sdk/openai-compatible';
 import env from '../config.js';
 import { createLogger } from '../logger.js';
-import type { NormalizedResult, UpstreamMessage, ToolCall } from '../types.js';
+import type { NormalizedResult, ToolCall, ToolChoice, ToolDefinition, UpstreamMessage } from '../types.js';
 import { validateRequest } from '../validate.js';
 import type { ChatProvider, ProviderCallOptions, UpstreamModel, StreamChunk } from './types.js';
 
 /** The SDK chat model handle returned by a call to `.chatModel(id)`. */
 export type V4ChatModel = ReturnType<ReturnType<typeof createOpenAICompatible>['chatModel']>;
+
+/** The exact prompt type `doGenerate`/`doStream` expect (v4 message array). */
+type V4Prompt = Parameters<V4ChatModel['doGenerate']>[0]['prompt'];
 
 /** A single text part — the only input shape this provider builds. */
 interface TextPart {
@@ -105,12 +108,11 @@ export class OpenAICompatibleProvider implements ChatProvider {
     }
 
     const result = await this.getClient().chatModel(model).doGenerate({
-      prompt: toV4Messages(messages),
+      prompt: toV4Messages(messages) as V4Prompt,
       // Forward the caller's per-call knobs into v4 call options so they reach the upstream request
-      // body (the SDK maps max_tokens -> maxOutputTokens, temperature, etc.). Omitted fields stay
-      // undefined and are dropped from the body — no change to defaults.
-      ...(options?.max_tokens != null ? { maxOutputTokens: options.max_tokens } : {}),
-      ...(options?.temperature != null ? { temperature: options.temperature } : {}),
+      // body (the SDK maps max_tokens -> maxOutputTokens, temperature, tools, toolChoice, etc.).
+      // Omitted fields stay undefined and are dropped from the body — no change to defaults.
+      ...forwardOptions(options),
     });
 
     return this.toNormalized(result);
@@ -139,13 +141,29 @@ export class OpenAICompatibleProvider implements ChatProvider {
       );
     }
 
-    const result = await this.getClient().chatModel(model).doStream({ prompt: toV4Messages(messages) });
+    const result = await this.getClient().chatModel(model).doStream({
+      prompt: toV4Messages(messages) as V4Prompt,
+      ...forwardOptions(opts?.options),
+    });
 
-    for await (const part of result.stream as AsyncIterable<{ type: string; delta?: string }>) {
+    for await (const part of result.stream as AsyncIterable<{ type: string; delta?: string; toolCallId?: string; toolName?: string; input?: unknown }>) {
       if (part.type === 'text-delta') {
         onChunk({ content: part.delta ?? null, reasoning: null });
       } else if (part.type === 'reasoning-delta') {
         onChunk({ reasoning: part.delta ?? null, content: null });
+      } else if (part.type === 'tool-call') {
+        // A finalized native tool call (FASE 2): the SDK has already accumulated its argument
+        // deltas. We emit the COMPLETE call in one chunk so the client receives a robust,
+        // parseable tool call rather than incremental argument fragments.
+        onChunk({
+          content: null,
+          reasoning: null,
+          tool_call: {
+            id: part.toolCallId ?? '',
+            type: 'function',
+            function: { name: part.toolName ?? '', arguments: stringifyArguments(part.input) },
+          },
+        });
       }
     }
   }
@@ -161,9 +179,15 @@ export class OpenAICompatibleProvider implements ChatProvider {
         content += part.text ?? '';
       } else if (part.type === 'reasoning') {
         reasoning += part.text ?? '';
+      } else if (part.type === 'tool-call') {
+        // The upstream model requested a native tool call (FASE 2): carry it through so the loop
+        // can delegate it to the client instead of executing it here.
+        tool_calls.push({
+          id: part.toolCallId,
+          type: 'function',
+          function: { name: part.toolName, arguments: stringifyArguments(part.input) },
+        });
       }
-      // Native tool calls are out of scope for this proxy's non-interactive upstream path; they are
-      // simply not produced and ignored here rather than carried through.
     }
 
     return {
@@ -186,25 +210,114 @@ export class OpenAICompatibleProvider implements ChatProvider {
 
 /** The distinct v4 message shapes the SDK requires (system is a string, others are part arrays). */
 type SystemMessage = { role: 'system'; content: string };
+
+type ToolCallPart = {
+  type: 'tool-call';
+  toolCallId: string;
+  toolName: string;
+  input: unknown;
+};
+type ToolResultPart = {
+  type: 'tool-result';
+  toolCallId: string;
+  toolName: string;
+  output: { type: 'text'; value: string };
+};
 type TextUserOrAssistantMessage = {
   role: 'user' | 'assistant';
-  content: Array<TextPart>;
+  content: Array<TextPart | ToolCallPart>;
 };
-type V4PromptEntry = SystemMessage | TextUserOrAssistantMessage;
+type ToolMessage = { role: 'tool'; content: ToolResultPart[] };
+type V4PromptEntry = SystemMessage | TextUserOrAssistantMessage | ToolMessage;
 
-/** Map loop messages (string content) to AI SDK v4 text-only messages. */
+/** Map loop messages to AI SDK v4 messages (text turns, delegated tool calls, tool results). */
 function toV4Messages(messages: UpstreamMessage[]): V4PromptEntry[] {
   return messages.map((message) => {
-    if (message.role === 'tool') {
-      // The interactive upstream path does not carry tool responses; skip them.
-      return { role: 'system', content: '' } satisfies SystemMessage;
-    }
     if (message.role === 'system') {
       return { role: 'system', content: message.content ?? '' } satisfies SystemMessage;
+    }
+    if (message.role === 'tool') {
+      // A tool-result turn (FASE 2 resume): the client ran a delegated tool and feeds the output
+      // back. The provider serializes it as a `tool` message the model understands.
+      return {
+        role: 'tool',
+        content: [
+          {
+            type: 'tool-result',
+            toolCallId: message.tool_call_id ?? '',
+            toolName: message.tool_name ?? 'tool',
+            output: { type: 'text', value: message.content ?? '' },
+          },
+        ],
+      } satisfies ToolMessage;
+    }
+    if (message.role === 'assistant' && message.tool_calls && message.tool_calls.length > 0) {
+      // A prior delegated turn (FASE 2 resume): the assistant asked for tool calls; content may be
+      // null on the wire when the turn carried only tool calls.
+      const parts: Array<TextPart | ToolCallPart> = [];
+      if (message.content) parts.push({ type: 'text', text: message.content });
+      for (const call of message.tool_calls) {
+        parts.push({
+          type: 'tool-call',
+          toolCallId: call.id,
+          toolName: call.function.name,
+          input: parseToolCallArguments(call.function.arguments),
+        });
+      }
+      return { role: 'assistant', content: parts } satisfies TextUserOrAssistantMessage;
     }
     return {
       role: message.role,
       content: [{ type: 'text', text: message.content ?? '' }],
     } satisfies TextUserOrAssistantMessage;
   });
+}
+
+/** Convert OpenAI-style request-body tools into the AI SDK tool shape (FASE 2). */
+function toSdkTools(tools?: ToolDefinition[]): Array<Record<string, unknown>> | undefined {
+  if (!tools || tools.length === 0) return undefined;
+  return tools.map((tool) => ({
+    type: 'function',
+    name: tool.function.name,
+    ...(tool.function.description !== undefined ? { description: tool.function.description } : {}),
+    inputSchema: tool.function.parameters ?? { type: 'object', properties: {} },
+  }));
+}
+
+/** Convert OpenAI `tool_choice` ('auto'|'none'|'required'|{function:{name}}) to the SDK shape. */
+function toSdkToolChoice(choice?: ToolChoice): Record<string, unknown> | undefined {
+  if (choice === undefined) return undefined;
+  if (typeof choice === 'string') return { type: choice };
+  return { type: 'tool', toolName: choice.function.name };
+}
+
+/** Forward per-call knobs into v4 call options (undefined fields are dropped from the body). */
+function forwardOptions(options?: ProviderCallOptions): Record<string, unknown> {
+  const out: Record<string, unknown> = {};
+  if (options?.max_tokens != null) out.maxOutputTokens = options.max_tokens;
+  if (options?.temperature != null) out.temperature = options.temperature;
+  const tools = toSdkTools(options?.tools);
+  if (tools) out.tools = tools;
+  const toolChoice = toSdkToolChoice(options?.tool_choice);
+  if (toolChoice) out.toolChoice = toolChoice;
+  return out;
+}
+
+/** Stringify a tool-call input (already a string upstream stays untouched). */
+function stringifyArguments(input: unknown): string {
+  if (typeof input === 'string') return input;
+  try {
+    return JSON.stringify(input ?? {});
+  } catch {
+    return '{}';
+  }
+}
+
+/** Parse a wire `arguments` string back into a JSON value for the SDK tool-call part. */
+function parseToolCallArguments(args: string): unknown {
+  try {
+    return JSON.parse(args) as unknown;
+  } catch {
+    return args;
+  }
 }

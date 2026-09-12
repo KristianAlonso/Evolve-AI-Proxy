@@ -1,7 +1,7 @@
 // Provider interface + upstream shapes. The core loop depends on ChatProvider, not
 // on the concrete OpenAI-compatible implementation, so tests can inject a stub.
 
-import type { NormalizedResult, UpstreamMessage } from '../types.js';
+import type { NormalizedResult, ToolCall, ToolChoice, ToolDefinition, UpstreamMessage } from '../types.js';
 
 /** A model advertised by /v1/models (only what we need from it). */
 export interface UpstreamModel {
@@ -14,16 +14,22 @@ export interface UpstreamModel {
 export interface ProviderCallOptions {
   max_tokens?: number | null;
   temperature?: number;
+  /** Client-side tools to delegate (FASE 2); forwarded to the upstream `tools` parameter. */
+  tools?: ToolDefinition[];
+  tool_choice?: ToolChoice;
 }
 
 /**
- * A single chunk of output delivered during streaming mode. Both fields are optional because an
- * upstream delta may carry only thinking text, only assistant text, or (for the terminal delta)
- * neither. The consumer is expected to accumulate across chunks rather than treat one as complete.
+ * A single chunk of output delivered during streaming mode. All fields are optional because an
+ * upstream delta may carry only thinking text, only assistant text, only a finalized tool call, or
+ * (for the terminal delta) none. The consumer is expected to accumulate across chunks rather than
+ * treat one as complete.
  */
 export interface StreamChunk {
   reasoning?: string | null; // reasoning/thinking produced by this delta ('' when none)
   content?: string | null;   // assistant text produced by this delta ('' when none)
+  /** A finalized native tool call requested by the model (FASE 2); one chunk per tool call. */
+  tool_call?: ToolCall | null;
 }
 
 /**

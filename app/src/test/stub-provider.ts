@@ -10,8 +10,8 @@
 //
 // A "no network" requirement — every call is served locally, no upstream access.
 
-import type { ChatProvider, UpstreamModel } from '../provider/types.js';
-import type { NormalizedResult, UpstreamMessage } from '../types.js';
+import type { ChatProvider, StreamChunk, UpstreamModel } from '../provider/types.js';
+import type { NormalizedResult, ToolCall, UpstreamMessage } from '../types.js';
 
 export interface StubRecord {
   model: string | null;
@@ -34,6 +34,8 @@ function baseRouter(opts?: {
   interpretation?: Record<string, unknown>;
   evalComplete?: boolean;
   output?: string | null;
+  /** FASE 2: the execute step responds with native tool calls (delegated to the client). */
+  toolCalls?: ToolCall[];
 }): Router {
   return (messages: UpstreamMessage[]) => {
     const combined = messages.map((m) => m.content ?? '').join('\n');
@@ -61,6 +63,11 @@ function baseRouter(opts?: {
 
     const optsOutput = opts?.output;
     if (optsOutput === null || optsOutput === undefined) {
+      // FASE 2: when the stub was told to request client-side tools, the execute step replies
+      // with tool calls and null content (the model asked for tools, not plain text).
+      if (opts?.toolCalls && opts.toolCalls.length > 0) {
+        return { content: null, reasoning: 'using tools', tool_calls: opts.toolCalls, refused: false, finish_reason: 'tool_calls', raw: {} };
+      }
       return { ...DEFAULT_EXECUTE, content: 'Task succeeded.' };
     }
     if (typeof optsOutput === 'string') return resp({ content: optsOutput });
@@ -73,6 +80,8 @@ export function stub(opts?: {
   interpretation?: Record<string, unknown>;
   evalComplete?: boolean;
   output?: string | null;
+  /** FASE 2: the execute step responds with native tool calls (delegated to the client). */
+  toolCalls?: ToolCall[];
 }): ChatProvider & { calls: StubRecord[] } {
   const record: StubRecord[] = [];
   const provider = baseRouter(opts);
@@ -91,6 +100,44 @@ export function stub(opts?: {
     },
     provider,
   );
+}
+
+/**
+ * A ChatProvider stub that ADDITIONALLY implements `completeStream`, delivering the routed result
+ * as live chunks (one reasoning chunk, then one content chunk) so unit tests can exercise the loop's
+ * streaming path (FASE 1: live reasoning from every phase). Routing is identical to `stub()`.
+ */
+export function streamingStub(opts?: {
+  interpretation?: Record<string, unknown>;
+  evalComplete?: boolean;
+  output?: string | null;
+  /** FASE 2: the execute step responds with native tool calls (delegated to the client). */
+  toolCalls?: ToolCall[];
+}): ChatProvider & { calls: StubRecord[] } {
+  const router = baseRouter(opts);
+  const record: StubRecord[] = [];
+  return {
+    async listModels() {
+      return [] as UpstreamModel[];
+    },
+    async complete(model, messages) {
+      record.push({ model, messages });
+      return router(messages);
+    },
+    async completeStream(model, messages, opts?: { options?: unknown; onChunk?: (c: StreamChunk) => void }) {
+      record.push({ model, messages });
+      const res = await router(messages);
+      const onChunk = opts?.onChunk;
+      if (!onChunk) return;
+      const reasoning = res.reasoning ?? '';
+      const content = res.content ?? '';
+      if (reasoning !== '') onChunk({ reasoning });
+      if (content !== '') onChunk({ content });
+      // FASE 2: deliver each finalized tool call as its own chunk (complete, not incremental).
+      for (const call of res.tool_calls) onChunk({ tool_call: call });
+    },
+    calls: record,
+  };
 }
 
 /** Convenience builder for a NormalizedResult. */

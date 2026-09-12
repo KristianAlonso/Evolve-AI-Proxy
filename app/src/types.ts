@@ -17,7 +17,29 @@ export interface UpstreamMessage {
   content: string | null;
   reasoning?: string;        // extracted reasoning/thinking, '' when none
   tool_calls?: ToolCall[];   // native tool calls, [] when none
+  /** role: 'tool' — the tool call this result answers (OpenAI wire field). */
+  tool_call_id?: string;
+  /** role: 'tool' — tool name convenience; provider falls back to the call name when absent. */
+  tool_name?: string;
 }
+
+/** OpenAI-style function-tool definition as sent in the request body `tools`. */
+export interface ToolDefinition {
+  type: 'function';
+  function: {
+    name: string;
+    description?: string;
+    /** JSON Schema for the tool input; defaults to an empty object schema upstream. */
+    parameters?: Record<string, unknown>;
+  };
+}
+
+/** OpenAI `tool_choice`: 'auto' | 'none' | 'required' | force one specific tool. */
+export type ToolChoice =
+  | 'auto'
+  | 'none'
+  | 'required'
+  | { type: 'function'; function: { name: string } };
 
 /** Token accounting reported by upstream. */
 export interface TokenUsage {
@@ -50,6 +72,12 @@ export interface ProxyRequest {
   max_retries?: number;           // default 3
   max_rounds?: number;            // default 10
   context_window_size?: number | null;
+
+  // Bidirectional tool delegation (FASE 2): client-side tools (opencode) that the upstream model
+  // may call. The proxy does NOT execute them — it surfaces the calls to the client, which runs
+  // them and sends the results back on the next request of the same session.
+  tools?: ToolDefinition[];
+  tool_choice?: ToolChoice;
 }
 
 /** Self-contained executable instruction generated for one step of the loop (SC-005). */
@@ -92,7 +120,11 @@ export type LoopDecision =
   | 'continue'
   | 'error'
   | 'max_rounds_exceeded'
-  | 'refusal_exhausted';
+  | 'refusal_exhausted'
+  // The upstream model requested client-side tool calls; the proxy delegated them to the client
+  // and pauses. The client executes the tools and resumes by re-sending the conversation
+  // (assistant tool_calls + tool results) on the same session (FASE 2).
+  | 'tool_calls_pending';
 
 /** Options passed from the orchestrator down into a provider call. */
 export interface CallOptions {
@@ -100,4 +132,6 @@ export interface CallOptions {
   max_tokens?: number | null;
   temperature?: number;
   context_window_size: number;
+  tools?: ToolDefinition[];
+  tool_choice?: ToolChoice;
 }

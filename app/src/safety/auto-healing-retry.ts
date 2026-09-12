@@ -4,7 +4,7 @@
 // error event + partial result (SC-013). The caller's runStep should use buildAutocorrectPrompt
 // so each heal targets the specific prior error.
 
-import type { TaskResult } from '../types.js';
+import type { TaskResult, ToolCall } from '../types.js';
 import { detectDoomLoop, type DoomLoopResult } from './doom-loop-detector.js';
 
 export interface RetryAttemptTrace {
@@ -17,6 +17,8 @@ export interface WithRetryOutcome {
   result: TaskResult;      // completed | failed (partial on exhaustion)
   doomedLoop: DoomLoopResult;
   traces: RetryAttemptTrace[];
+  /** Native tool calls the step requested (FASE 2) — empty when the step produced plain text. */
+  tool_calls: ToolCall[];
 }
 
 /**
@@ -24,7 +26,7 @@ export interface WithRetryOutcome {
  * throws on failure or returns { output, reasoning }. Returns a TaskResult plus per-attempt traces (SC-013/014).
  */
 export async function withAutoHealingRetry(
-  runStep: () => Promise<{ output: string; reasoning: string }>,
+  runStep: () => Promise<{ output: string; reasoning: string; tool_calls?: ToolCall[] }>,
   options: {
     maxRetries?: number; // default 3 (SC-013)
     doomLoopThreshold?: number; // SC-012
@@ -37,6 +39,7 @@ export async function withAutoHealingRetry(
   let attempts = 0;
   let lastDoomed: DoomLoopResult = { detected: false, repetitions: 0 };
   let lastError = '';
+  let lastToolCalls: ToolCall[] = [];
 
   // First attempt, then up to `maxRetries` healing retries. SC-013/014: every failed attempt that
   // triggers a heal is recorded as a separate trace. The terminal (exhausted) attempt surfaces only
@@ -45,14 +48,17 @@ export async function withAutoHealingRetry(
     const exhausted = attempt > maxRetries;
 
     try {
-      const { output, reasoning } = await runStep();
+      const { output, reasoning, tool_calls } = await runStep();
+      if (tool_calls) lastToolCalls = tool_calls;
       attempts++;
       const doomed = detectDoomLoop(reasoning || output, threshold);
       lastDoomed = doomed;
 
       if (!doomed.detected) {
         // Recovered cleanly — still report the failures that preceded success. SC-013/014.
-        return finishSuccess(output, reasoning, attempts, doomed, traces);
+        const outcome = finishSuccess(output, reasoning, attempts, doomed, traces);
+        outcome.tool_calls = lastToolCalls;
+        return outcome;
       }
 
       // A runaway repeat: heal it (trace + retry) unless we have already exhausted retries. SC-012.
@@ -67,7 +73,9 @@ export async function withAutoHealingRetry(
   }
 
   // Should not normally reach here; guard for exhausted loop without throw. SC-012/013.
-  return finishFailure(attempts, traces, lastError || 'step failed', lastDoomed);
+  const outcome = finishFailure(attempts, traces, lastError || 'step failed', lastDoomed);
+  outcome.tool_calls = lastToolCalls;
+  return outcome;
 }
 
 function finishSuccess(
@@ -81,6 +89,7 @@ function finishSuccess(
     result: { id: '', status: 'completed', output, reasoning, attempts },
     doomedLoop,
     traces: failedTraces.slice(),
+    tool_calls: [],
   };
 }
 
@@ -98,6 +107,7 @@ function finishFailure(
     result: { id: '', status: 'failed', output: '', reasoning, attempts, error },
     doomedLoop,
     traces,
+    tool_calls: [],
   };
 }
 

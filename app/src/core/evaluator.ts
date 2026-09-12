@@ -3,6 +3,7 @@
 
 import type { ChatProvider } from '../provider/types.js';
 import type { NormalizedResult, UpstreamMessage, TaskResult } from '../types.js';
+import { callWithStreaming, type LiveEmitter } from './stream-helper.js';
 
 const YES_PATTERNS = /(^|[\s([:punct:]])yes|true|completed|done|complete|sí|si[^l]|affirmative|correcta(?:mente)?/i;
 const NO_PATTERNS = /\bno\b|false|not complete|incomplete|no\b.*still|\bsimilar\b/i;
@@ -54,17 +55,27 @@ export async function evaluateTask(
   accumulatedContext: string,
   taskResult: TaskResult,
   options?: { model: string | null; max_tokens?: number },
-): Promise<{ decision: 'complete' | 'continue'; reasoning: string }> {
+  emitter?: LiveEmitter,
+): Promise<{ decision: 'complete' | 'continue'; reasoning: string; streamed: boolean }> {
   const prompt = buildEvaluatePrompt(originalInstruction, accumulatedContext, taskResult);
-  const result: NormalizedResult = await provider.complete(
-    options?.model ?? null, // concrete user-selected model — never "auto" (no-auto rule)
-    prompt,
-    { max_tokens: options?.max_tokens ?? 128 },
-  );
+  const { result, streamed } = await callWithStreaming({
+    provider,
+    model: options?.model ?? null, // concrete user-selected model — never "auto" (no-auto rule)
+    messages: prompt,
+    options: { max_tokens: options?.max_tokens ?? 128 },
+    surfaceDelta: emitter ? (chunk) => {
+      const reasoning = typeof chunk.reasoning === 'string' ? chunk.reasoning : '';
+      if (reasoning !== '') emitter.emitReasoningDelta(0, reasoning);
+    } : undefined,
+  });
   const answer = result.content?.trim() || '';
   // If the model produced no usable content, treat as "continue".
-  if (!answer) return { decision: 'continue', reasoning: result.reasoning };
+  if (!answer) return { decision: 'continue', reasoning: result.reasoning, streamed };
 
   const classification = classifyEvaluation(answer);
-  return { decision: classification.decision, reasoning: `${result.reasoning}\nnormalized: ${classification.normalized}` };
+  return {
+    decision: classification.decision,
+    reasoning: `${result.reasoning}\nnormalized: ${classification.normalized}`,
+    streamed,
+  };
 }

@@ -6,10 +6,11 @@
 import type { ChatProvider } from '../provider/types.js';
 import { createLogger } from '../logger.js';
 import type { Phase, SSEEvent } from '../sse-writer.js';
-import type { AgentTask, LoopDecision, TaskResult, UpstreamMessage } from '../types.js';
+import type { AgentTask, LoopDecision, TaskResult, ToolCall, ToolChoice, ToolDefinition, UpstreamMessage } from '../types.js';
 import { interpretRequest, type Interpretation } from './interpreter.js';
 import { generateTasks } from './task-generator.js';
 import { evaluateTask } from './evaluator.js';
+import { callWithStreaming } from './stream-helper.js';
 import { withAutoHealingRetry } from '../safety/auto-healing-retry.js';
 import { ContextManager, type ContextStep } from './context-manager.js';
 import { detectDoomLoop, type DoomLoopResult } from '../safety/doom-loop-detector.js';
@@ -22,6 +23,8 @@ export interface LoopSink {
   emitReasoningDelta(iteration: number, delta: string): void;
   /** Emit one live assistant-text delta as an OpenAI chat-completion.chunk during streaming (dual path). */
   emitContent(_iteration: number, _text: string): void;
+  /** Emit delegated tool calls as OpenAI chat-completion.chunk frames (FASE 2). */
+  emitToolCalls(calls: ToolCall[]): void;
   writeEvent(event: SSEEvent, data: Record<string, unknown>): void;
   emitPhase(phase: Phase, extra?: Record<string, unknown>): void;
 }
@@ -33,6 +36,10 @@ export interface LoopOptions {
   doom_loop_threshold?: number; // SC-012
   context_window_size: number; // SC-022
   model?: string | null;
+  /** Client-side tools to delegate (FASE 2). Only the execute step sees them — interpretation,
+   *  planning and evaluation keep their internal structured prompts tool-free. */
+  tools?: ToolDefinition[];
+  tool_choice?: ToolChoice;
 }
 
 export interface LoopTrace {
@@ -54,10 +61,17 @@ export interface FinalResultData {
     errors_occurred: number;
   };
   accumulated_context: string;
+  /** Tool calls delegated to the client when the decision is 'tool_calls_pending' (FASE 2). */
+  tool_calls: ToolCall[];
 }
 
 /** One self-contained execution attempt inside the auto-healing wrapper. */
-type ExecStep = () => Promise<{ output: string; reasoning: string; doomedLoop: DoomLoopResult }>;
+type ExecStep = () => Promise<{
+  output: string;
+  reasoning: string;
+  doomedLoop: DoomLoopResult;
+  tool_calls: ToolCall[];
+}>;
 
 export class AgentLoop {
   private provider: ChatProvider;
@@ -87,7 +101,16 @@ export class AgentLoop {
     const trace: LoopTrace[] = [];
     const accumulatedSteps: ContextStep[] = [];
     let lastOutput = '';
+    let pendingToolCalls: ToolCall[] = [];
     let round = 0;
+
+    // FASE 2: the internal loop phases (interpret/planify/evaluate) never see the structured
+    // tool-exchange turns that travel on the wire (assistant tool_calls + tool results) — those
+    // are wire-protocol artifacts, and re-sending them as provider tool messages can trip
+    // provider-specific requirements (e.g. Gemini thought_signatures) on resume. They are rendered
+    // as plain text for the internal phases; the structured transcript is injected into the
+    // execute prompt instead (see buildExecuteContent / buildToolTranscript).
+    const internalMessages = toInternalMessages(messages);
 
     for (; round < o.max_rounds; round++) {
       try {
@@ -96,8 +119,11 @@ export class AgentLoop {
         // ---- Interpret phase (SC-004): ask the model to interpret, surface structured reasoning. ----
         this.phaseSet.add('interpreting');
         this.emitPhase('interpreting', { step: 'interpret' });
-        const interp = await interpretRequest(this.provider, [...messages], () => '', { model: o.model });
-        if (this.sink) this.sink.emitReasoning(0, interp.reasoning || interp.interpretation.mainObjective);
+        // FASE 1: pass the sink as the live emitter so interpretation reasoning deltas reach the
+        // client WHILE the upstream generates them. When the provider streamed, the full-text
+        // fallback emit below would duplicate what already left on the wire — skip it then.
+        const interp = await interpretRequest(this.provider, [...internalMessages], () => '', { model: o.model }, this.sink);
+        if (this.sink && !interp.streamed) this.sink.emitReasoning(0, interp.reasoning || interp.interpretation.mainObjective);
 
         // ---- Initial task generation from the interpretation (SC-005). ----
         let tasks = await generateTasks(this.provider, originalInstruction, interp.interpretation);
@@ -112,47 +138,52 @@ export class AgentLoop {
         const executeStep: ExecStep = async () => {
           const prompt = [
             ...this.buildContextPrompt(originalInstruction, accumulatedSteps),
-            { role: 'user' as const, content: task.description },
+            { role: 'user' as const, content: this.buildExecuteContent(task, messages) },
           ];
 
-          // On the stream path (sink present) AND when the provider can actually stream, run with a
-          // live SSE token stream so reasoning reaches the client in real time. The buffered call is
-          // used otherwise — including every one of the unit tests' stubbed providers.
-          const streaming = Boolean(this.sink) && typeof this.provider.completeStream === 'function';
-          if (!streaming) {
+          // The provider call options carry the delegated client tools (FASE 2); interpretation /
+          // planning / evaluation never receive them.
+          const callOptions = { tools: o.tools, tool_choice: o.tool_choice };
+
+          // No watcher, or a provider without completeStream (unit-test stubs): fully buffered call.
+          if (!this.sink) {
             this.countCall('execute');
-            const res = await this.provider.complete(o.model, prompt, {});
-            return { output: res.content ?? '', reasoning: res.reasoning || '', doomedLoop: { detected: false, repetitions: 0 } };
+            const res = await this.provider.complete(o.model, prompt, callOptions);
+            return { output: res.content ?? '', reasoning: res.reasoning || '', doomedLoop: { detected: false, repetitions: 0 }, tool_calls: res.tool_calls };
           }
 
           // ---- Streaming attempt: stream live thinking + detect a runaway while it generates. ----
-          let accReasoning = '';
-          let accContent = '';
+          // callWithStreaming invokes completeStream WITH the provider as its receiver — a detached
+          // reference (`const f = this.provider.completeStream; f(...)`) loses `this` and the SDK
+          // client lookup throws (see the warning in stream-helper.ts). It also accumulates the full
+          // body for us, so the returned result is parseable like a buffered complete() call.
+          let acc = '';
           let lastDoomed: DoomLoopResult = { detected: false, repetitions: 0 };
 
-          const completeStream = this.provider.completeStream; // narrow optional method off the loop field so flow narrowing holds inside the closure below.
-          if (!completeStream) return { output: '', reasoning: '', doomedLoop: lastDoomed };
+          const { result } = await callWithStreaming({
+            provider: this.provider,
+            model: o.model,
+            messages: prompt,
+            options: callOptions,
+            surfaceDelta: (chunk) => {
+              const reasoning = typeof chunk.reasoning === 'string' ? chunk.reasoning : '';
+              const content = typeof chunk.content === 'string' ? chunk.content : '';
 
-          await completeStream(o.model, prompt, { options: {}, onChunk: (chunk) => {
-            const delta = chunk.reasoning ?? null;
-            const textDelta = delta == null ? '' : delta;
-            accReasoning += textDelta;
-
-            // Live reasoning trace to the client — incremental per arriving delta.
-            if (this.sink && textDelta !== '') this.sink.emitReasoningDelta(round + 1, textDelta);
-            if (typeof chunk.content === 'string' && chunk.content !== '') {
-              accContent += chunk.content;
+              // Live reasoning trace to the client — incremental per arriving delta.
+              if (reasoning !== '') this.sink?.emitReasoningDelta(round + 1, reasoning);
               // Surface live assistant text so the OpenAI client reconstructs the answer as it arrives.
-              this.sink?.emitContent(round + 1, chunk.content);
-            }
+              if (content !== '') this.sink?.emitContent(round + 1, content);
 
-            // Detect a doom-loop mid-generation so we can abort the fetch instead of waiting for the
-            // whole answer to arrive. detectDoomLoop is the same pure function used post-hoc below.
-            const doomed = detectDoomLoop(accReasoning + accContent, o.doom_loop_threshold);
-            if (doomed.detected) lastDoomed = doomed;
-          }});
+              // Detect a doom-loop mid-generation so a runaway is visible while the model still
+              // generates. detectDoomLoop is the same pure function used post-hoc by the retry guard.
+              acc += reasoning + content;
+              const doomed = detectDoomLoop(acc, o.doom_loop_threshold);
+              if (doomed.detected) lastDoomed = doomed;
+            },
+          });
+          this.countCall('execute');
 
-          return { output: accContent, reasoning: accReasoning, doomedLoop: lastDoomed };
+          return { output: (result.content ?? ''), reasoning: result.reasoning || '', doomedLoop: lastDoomed, tool_calls: result.tool_calls };
         };
 
         let outcome;
@@ -174,6 +205,23 @@ export class AgentLoop {
           break;
         }
 
+        // ---- Bidirectional tool delegation (FASE 2): the upstream model requested client-side
+        // tool calls. We do NOT execute them: surface every call to the client (as OpenAI
+        // chat-completion chunks) and pause the loop. The client runs the tools and resumes by
+        // re-sending the conversation — assistant tool_calls + tool results — on the same session.
+        const delegatedCalls: ToolCall[] = outcome.tool_calls ?? [];
+        if (delegatedCalls.length > 0) {
+          this.sink?.emitToolCalls(delegatedCalls);
+          decision = 'tool_calls_pending';
+          pendingToolCalls = delegatedCalls;
+          trace.push({
+            iteration: round + 1,
+            phase: 'executing_task',
+            content: `delegating ${delegatedCalls.length} tool call(s) to the client: ${delegatedCalls.map((c) => c.function.name).join(', ')}`,
+          });
+          break;
+        }
+
         if (this.sink) this.sink.writeEvent('task_result', { task_id: result.id, output: result.output });
         if (outcome.doomedLoop.detected && this.sink) {
           trace.push({ iteration: round + 1, phase: 'executing_task', content: `doom-loop detected: ${outcome.doomedLoop.repeatedPhrase ?? ''}` });
@@ -192,9 +240,18 @@ export class AgentLoop {
 
         // ---- Binary evaluation (SC-007/008). ----
         this.emitPhase('evaluating', { step: `evaluate #${round + 1}` });
-        const evalCall = await evaluateTask(this.provider, originalInstruction, this.accumulatedSummary(accumulatedSteps), result, { model: o.model });
+        // FASE 1: stream the evaluator's reasoning live too; on the buffered path keep the previous
+        // whole-text emit so no tracing is lost when the provider cannot stream.
+        const evalCall = await evaluateTask(this.provider, originalInstruction, this.accumulatedSummary(accumulatedSteps), result, { model: o.model }, this.sink);
         this.countCall('evaluate');
-        if (this.sink) this.sink.emitReasoning(round + 1, `${evalCall.reasoning}\n-> ${evalCall.decision}`);
+        if (this.sink) {
+          if (evalCall.streamed) {
+            // The "why" already arrived as live deltas; only append the binary decision marker.
+            this.sink.emitReasoningDelta(round + 1, ` -> ${evalCall.decision}`);
+          } else {
+            this.sink.emitReasoning(round + 1, `${evalCall.reasoning}\n-> ${evalCall.decision}`);
+          }
+        }
         trace.push({ iteration: round + 1, phase: 'evaluating', content: evalCall.decision === 'complete' ? 'COMPLETE' : 'CONTINUE' });
 
         if (evalCall.decision === 'complete') {
@@ -241,6 +298,7 @@ export class AgentLoop {
         errors_occurred: 0,
       },
       accumulated_context: this.accumulatedSummary(accumulatedSteps),
+      tool_calls: pendingToolCalls,
     };
 
     if (this.sink) this.sink.emitPhase('completed', { final_output_length: lastOutput.length });
@@ -254,6 +312,8 @@ export class AgentLoop {
       doom_loop_threshold: this.opts.doom_loop_threshold ?? 4, // SC-012
       context_window_size: this.opts.context_window_size ?? 4096, // SC-022
       model: this.opts.model ?? null,
+      tools: this.opts.tools,
+      tool_choice: this.opts.tool_choice,
     };
   }
 
@@ -277,6 +337,30 @@ export class AgentLoop {
     ];
   }
 
+  /**
+   * Build the execute user turn (FASE 2): the task, plus — when client tools are in play — the
+   * instructions that tools exist, and the transcript of the tool exchange already performed by
+   * the client (assistant tool_calls + tool results re-sent in the incoming conversation) so a
+   * resumed run continues from where the delegation paused.
+   */
+  private buildExecuteContent(task: AgentTask, incoming: UpstreamMessage[]): string {
+    const parts: string[] = [task.description];
+    if (this.opts.tools && this.opts.tools.length > 0) {
+      parts.push(
+        [
+          'Client-side tools are available to you. If a tool is required to accomplish the task,',
+          'emit the tool call instead of plain text: the client executes it and returns the',
+          'result. Reply with plain text only when the task is complete.',
+        ].join(' '),
+      );
+    }
+    const transcript = buildToolTranscript(incoming);
+    if (transcript) {
+      parts.push(`Tool exchange already performed by the client (keep using these results):\n${transcript}`);
+    }
+    return parts.join('\n\n');
+  }
+
   private accumulatedSummary(steps: ContextStep[]): string {
     if (!steps.length) return '';
     const parts = steps.map((s, i) => `- iter ${i + 1}: ${s.output.slice(0, 160)}`).join('\n');
@@ -289,12 +373,80 @@ export class AgentLoop {
       { role: 'user', content: `Goal hint:\n${goalHint}\n\nReply EXACTLY with one AgentTask JSON: {"description":"<one clear sentence>"}` },
     ];
     this.countCall('planify');
-    const res = await this.provider.complete(this.opts.model ?? null, prompt, {});
-    return { id: `task-refine-${Date.now()}`, description: (res.content ?? '').trim(), context_needed: [] };
+    // FASE 1: planning reasoning also streams live to a watching client. The task-description JSON
+    // is internal — only the thinking path is surfaced (same rule as interpretation/evaluation).
+    const { result } = await callWithStreaming({
+      provider: this.provider,
+      model: this.opts.model ?? null,
+      messages: prompt,
+      options: {},
+      surfaceDelta: this.sink
+        ? (chunk) => {
+            const reasoning = typeof chunk.reasoning === 'string' ? chunk.reasoning : '';
+            if (reasoning !== '') this.sink?.emitReasoningDelta(0, reasoning);
+          }
+        : undefined,
+    });
+    return { id: `task-refine-${Date.now()}`, description: (result.content ?? '').trim(), context_needed: [] };
   }
 }
 
 /** A tiny hint used to ask the model for its next best sub-goal. */
 function nextGoalHint(original: string, lastOutput: string): string {
   return `The goal is: "${original}". Previous attempt produced roughly: ${(lastOutput || '').slice(0, 240)}`;
+}
+
+/**
+ * Sanitize the incoming wire conversation for the internal loop phases (FASE 2): assistant
+ * tool_call turns and tool-result turns are collected and rendered as a single plain-text USER
+ * turn. Reasons:
+ *   1. The interpret/planify/evaluate prompts never carry structured tool parts (providers with
+ *      opaque per-provider requirements like Gemini thought_signatures must not see them).
+ *   2. The rendered turn is `role: user` — Vertex-backed models reject requests whose final
+ *      message is an assistant/model turn.
+ */
+function toInternalMessages(messages: UpstreamMessage[]): UpstreamMessage[] {
+  const out: UpstreamMessage[] = [];
+  let exchange: string[] = [];
+  const flushExchange = (out: UpstreamMessage[]): void => {
+    if (exchange.length > 0) {
+      out.push({ role: 'user', content: `Tool exchange (already performed by the client):\n${exchange.join('\n')}` });
+      exchange = [];
+    }
+  };
+  for (const message of messages) {
+    if (message.role === 'tool') {
+      exchange.push(`tool result for ${message.tool_call_id ?? ''}: ${message.content ?? ''}`);
+      continue;
+    }
+    if (message.role === 'assistant' && message.tool_calls && message.tool_calls.length > 0) {
+      for (const call of message.tool_calls) {
+        exchange.push(`assistant tool_call ${call.id}: ${call.function.name}(${call.function.arguments})`);
+      }
+      if (message.content) exchange.push(`assistant: ${message.content}`);
+      continue;
+    }
+    flushExchange(out);
+    out.push(message);
+  }
+  flushExchange(out);
+  return out;
+}
+
+/**
+ * Render the tool exchange already present in the incoming conversation (FASE 2 resume): assistant
+ * tool_call turns followed by the client's tool results. Empty when the conversation has none.
+ */
+function buildToolTranscript(messages: UpstreamMessage[]): string {
+  const lines: string[] = [];
+  for (const message of messages) {
+    if (message.role === 'assistant' && message.tool_calls && message.tool_calls.length > 0) {
+      for (const call of message.tool_calls) {
+        lines.push(`assistant tool_call ${call.id}: ${call.function.name}(${call.function.arguments})`);
+      }
+    } else if (message.role === 'tool') {
+      lines.push(`tool result for ${message.tool_call_id ?? ''}: ${message.content ?? ''}`);
+    }
+  }
+  return lines.join('\n');
 }
