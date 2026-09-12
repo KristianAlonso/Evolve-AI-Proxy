@@ -37,7 +37,8 @@ export interface MapSubagentToolOptions {
   logger?: TraceLogger;
   traceId?: string;
   abort_signal?: AbortSignal;
-  max_tokens?: number;
+  /** ADR A-007 (passthrough-intacto): the client's request parameters, forwarded as-is. */
+  passthrough?: Record<string, unknown>;
 }
 
 /** Ask the model to identify the subagent-spawn tool among the client's tools and map its args. */
@@ -104,8 +105,10 @@ export async function mapSubagentTool(
   for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
     try {
       const result = await provider.complete(options.model, messages, {
-        // Generous: reasoning models spend most of the budget thinking before emitting the (small) JSON answer.
-        max_tokens: options.max_tokens ?? 8192,
+        // ADR A-007 (passthrough-intacto): no invented max_tokens budget — the client's request
+        // parameters (temperature, max_tokens, ...) are forwarded exactly as sent; no client value
+        // means no field in the upstream call.
+        passthrough: options.passthrough,
         logger: options.logger,
         trace_id: options.traceId,
         abort_signal: options.abort_signal,

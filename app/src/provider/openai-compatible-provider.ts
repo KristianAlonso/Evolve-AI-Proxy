@@ -33,9 +33,17 @@ export interface ProviderClient {
 /** Builds the SDK-backed client from a base URL / API key (production default). */
 type ClientFactory = (baseUrl: string, apiKey: string | undefined) => ProviderClient;
 
+/**
+ * Stable provider name for the SDK client. The SDK derives its `providerOptions` namespace from
+ * this name (`providerOptions[providerName]`), and ADR A-007 uses that namespace as the raw
+ * channel that carries the client's unknown request fields verbatim into the upstream body — so
+ * the name must be STABLE (a host-derived name like the old default would break the namespace and
+ * would contain dots/colons that mangle it). Exported so `forwardOptions()` and tests agree on it.
+ */
+export const PROVIDER_NAME = 'evolve_upstream';
+
 function createSdkClient(baseUrl: string, apiKey: string | undefined): ProviderClient {
-  const name = baseUrl.split('//')[1]?.split('/')[0] ?? 'openai-compatible';
-  const sdk = createOpenAICompatible({ baseURL: `${baseUrl}/v1`, name, apiKey });
+  const sdk = createOpenAICompatible({ baseURL: `${baseUrl}/v1`, name: PROVIDER_NAME, apiKey });
   // `chatModel` is the only surface we depend on — re-expose it so tests can swap in a fake client.
   return { chatModel: (modelId: string) => sdk.chatModel(modelId as any) };
 }
@@ -112,8 +120,9 @@ export class OpenAICompatibleProvider implements ChatProvider {
           messages,
           tools: options?.tools ?? [],
           tool_choice: options?.tool_choice ?? null,
-          max_tokens: options?.max_tokens ?? null,
-          temperature: options?.temperature ?? null,
+          // ADR A-007 (passthrough-intacto): the FULL forwarded request shape — every client field
+          // the proxy passes through, verbatim (no max_tokens/temperature here any more).
+          passthrough: options?.passthrough ?? {},
         },
         data,
       };
@@ -435,13 +444,86 @@ function toSdkToolChoice(choice?: ToolChoice): Record<string, unknown> | undefin
 
 /** Forward per-call knobs into v4 call options (undefined fields are dropped from the body). */
 function forwardOptions(options?: ProviderCallOptions): Record<string, unknown> {
+  return buildForwardOptions(options);
+}
+
+/**
+ * ADR A-007 — passthrough-intacto. Maps the client's request fields into what the SDK must see:
+ *  - recognized fields -> standard v4 options (the SDK knows their OpenAI body field names);
+ *  - everything else  -> `providerOptions[PROVIDER_NAME]`, which the SDK spreads RAW into the
+ *    upstream request body (top_k, logprobs, stream_options, user, metadata, service_tier,
+ *    parallel_tool_calls, reasoning_effort, response_format, ...). The proxy never invents values:
+ *    what the client did not set is simply not sent.
+ * Reserved keys (messages/model/stream are transformed or SDK-managed; tools/tool_choice ride
+ * their own converted path; the evolve_* controls are proxy directives, not model API params).
+ */
+/**
+ * Client body fields that are NEVER forwarded: `messages`/`model` are transformed (the loop
+ * rebuilds the conversation, the model is alias-resolved), `stream` is SDK-managed (doGenerate =
+ * buffered, doStream = stream), `tools`/`tool_choice` ride their own converted path below, and the
+ * evolve controls are proxy directives, not model API parameters.
+ */
+const RESERVED_PASSTHROUGH_KEYS: ReadonlySet<string> = new Set([
+  'model',
+  'messages',
+  'stream',
+  'tools',
+  'tool_choice',
+  'max_rounds',
+  'max_retries',
+  'doom_loop_threshold',
+  'context_window_size',
+]);
+
+export function buildForwardOptions(options?: ProviderCallOptions): Record<string, unknown> {
   const out: Record<string, unknown> = {};
-  if (options?.max_tokens != null) out.maxOutputTokens = options.max_tokens;
-  if (options?.temperature != null) out.temperature = options.temperature;
+  const raw: Record<string, unknown> = {};
+  for (const [key, value] of Object.entries(options?.passthrough ?? {})) {
+    if (RESERVED_PASSTHROUGH_KEYS.has(key) || value === undefined) continue;
+    switch (key) {
+      // Recognized fields: the SDK already knows their OpenAI body field names.
+      case 'temperature':
+        out.temperature = value as number;
+        break;
+      case 'top_p':
+        out.topP = value as number;
+        break;
+      case 'max_tokens':
+        out.maxOutputTokens = value as number;
+        break;
+      case 'seed':
+        out.seed = value as number;
+        break;
+      case 'stop':
+        out.stopSequences = Array.isArray(value) ? value : [value];
+        break;
+      case 'frequency_penalty':
+        out.frequencyPenalty = value as number;
+        break;
+      case 'presence_penalty':
+        out.presencePenalty = value as number;
+        break;
+      case 'reasoning_effort':
+        // The SDK writes `reasoning_effort` into the body AFTER its raw providerOptions spread
+        // (with `undefined` when the v4 `reasoning` option is unset — a raw entry would be
+        // clobbered). A string `reasoning` is the SDK's "custom reasoning" payload and is passed
+        // straight through to the body's `reasoning_effort` field.
+        out.reasoning = value as string;
+        break;
+      default:
+        raw[key] = value; // top_k, logprobs, stream_options, user, metadata, ...
+    }
+  }
   const tools = toSdkTools(options?.tools);
   if (tools) out.tools = tools;
   const toolChoice = toSdkToolChoice(options?.tool_choice);
   if (toolChoice) out.toolChoice = toolChoice;
+  if (Object.keys(raw).length > 0) {
+    // The SDK spreads every unknown providerOptions[key] entry verbatim into the request body —
+    // that is the verbatim channel for the fields it does not model natively (top_k is explicitly
+    // "unsupported" by the SDK, so it MUST come through here).
+    out.providerOptions = { [PROVIDER_NAME]: raw };
+  }
   return out;
 }
 

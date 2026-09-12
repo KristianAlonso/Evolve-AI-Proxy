@@ -13,8 +13,17 @@ export interface UpstreamModel {
 
 /** Extra knobs a provider call may accept. */
 export interface ProviderCallOptions {
-  max_tokens?: number | null;
-  temperature?: number;
+  /**
+   * Passthrough-intacto (ADR A-007): the client request's body fields, verbatim, MINUS
+   * messages/model/stream/tools/tool_choice and the evolve proxy controls. The provider forwards
+   * them to the upstream exactly as the client sent them: recognized fields are mapped into
+   * provider v4 options (temperature, top_p, max_tokens, seed, stop, frequency_penalty,
+   * presence_penalty); every other field (top_k, logprobs, stream_options, user, metadata,
+   * service_tier, parallel_tool_calls, reasoning_effort, response_format, ...) rides raw into the
+   * upstream request body through the SDK's providerOptions. The proxy NEVER invents values —
+   * no field set by the client means no field sent.
+   */
+  passthrough?: Record<string, unknown>;
   /** Client-side tools to delegate (FASE 2); forwarded to the upstream `tools` parameter. */
   tools?: ToolDefinition[];
   tool_choice?: ToolChoice;

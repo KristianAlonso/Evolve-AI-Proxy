@@ -19,7 +19,7 @@ export async function interpretRequest(
   provider: ChatProvider,
   messages: UpstreamMessage[],
   buildPrompt: (messages: UpstreamMessage[]) => string,
-  options?: { model: string | null; max_tokens?: number; logger?: TraceLogger; traceId?: string; abort_signal?: AbortSignal },
+  options?: { model: string | null; logger?: TraceLogger; traceId?: string; abort_signal?: AbortSignal; passthrough?: Record<string, unknown> },
   emitter?: LiveEmitter,
 ): Promise<{ interpretation: Interpretation; reasoning: string; streamed: boolean }> {
   const instruction = [
@@ -45,7 +45,10 @@ export async function interpretRequest(
     provider,
     model: options?.model ?? null, // concrete user-selected model — never "auto" (no-auto rule)
     messages: promptMessages,
-    options: { max_tokens: options?.max_tokens ?? 512, logger: options?.logger, trace_id: options?.traceId, abort_signal: options?.abort_signal },
+    // ADR A-007 (passthrough-intacto): no invented max_tokens budget — the client's request
+    // parameters (temperature, max_tokens, ...) are forwarded exactly as sent; no client value means
+    // no field in the upstream call.
+    options: { passthrough: options?.passthrough, logger: options?.logger, trace_id: options?.traceId, abort_signal: options?.abort_signal },
     surfaceDelta: emitter ? (chunk) => {
       const reasoning = typeof chunk.reasoning === 'string' ? chunk.reasoning : '';
       if (reasoning !== '') emitter.emitReasoningDelta(0, reasoning);

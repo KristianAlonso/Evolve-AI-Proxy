@@ -86,3 +86,8 @@ typings/
 
 # DynamoDB Local files
 .dynamodb/
+
+# Debug scratch (wire dumps, opencode test runs)
+.claude/
+app/tmp-wire/
+tmp-oc/

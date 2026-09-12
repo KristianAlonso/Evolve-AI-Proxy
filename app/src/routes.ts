@@ -321,6 +321,12 @@ export async function createApp(options: CreateAppOptions = {}): Promise<Fastify
 
     // Map evolve controls down to orchestrator options. `tools`/`tool_choice` carry the client's
     // delegated tools (FASE 2): only the loop's execute step forwards them to the upstream.
+    // ADR A-007 (passthrough-intacto): everything the client sent in the body — except the fields
+    // the proxy itself transforms (messages/model/stream/tools/tool_choice) or owns (evolve
+    // controls) — rides verbatim into EVERY upstream call (loop phases, subagent phases, the
+    // mapper). No invented defaults, no dropped parameters.
+    const passthrough = buildPassthrough(body);
+
     const loopOpts: LoopOptions = {
       max_rounds: body.max_rounds ?? 10,
       max_retries: body.max_retries ?? 3,
@@ -332,6 +338,7 @@ export async function createApp(options: CreateAppOptions = {}): Promise<Fastify
       logger: log,
       traceId,
       abort_signal: abortController.signal,
+      passthrough,
     };
     log.info(`loop configured: max_rounds=${loopOpts.max_rounds} max_retries=${loopOpts.max_retries} context_window=${loopOpts.context_window_size}`);
 
@@ -394,6 +401,7 @@ export async function createApp(options: CreateAppOptions = {}): Promise<Fastify
             log,
             traceId,
             abort_signal: abortController.signal,
+            passthrough,
           });
           log.info(`request done (subagent phase): parent=${parent.sessionId} agent_id=${binding.agentId} phase=${binding.phase} stream=${!!body.stream} elapsed=${Date.now() - requestStart}ms`);
           return;
@@ -418,6 +426,7 @@ export async function createApp(options: CreateAppOptions = {}): Promise<Fastify
           logger: log,
           traceId,
           abort_signal: abortController.signal,
+          passthrough,
         });
         if (remapped) {
           log.warn(
@@ -483,6 +492,7 @@ export async function createApp(options: CreateAppOptions = {}): Promise<Fastify
           : undefined,
         traceId,
         abort_signal: abortController.signal,
+        passthrough,
       });
       if (started) {
         const { outcome } = started;
@@ -585,6 +595,7 @@ async function handleSubagentPhase(params: {
   log: TraceLogger;
   traceId: string;
   abort_signal: AbortSignal;
+  passthrough?: Record<string, unknown>;
 }): Promise<void> {
   const { reply, log, traceId, model, stream, abort_signal, provider, state, binding } = params;
   const orchestrator = new SubagentOrchestrator(provider, log);
@@ -593,13 +604,13 @@ async function handleSubagentPhase(params: {
     if (stream) {
       const writer = new SseWriter(reply, log);
       const sink = new SinkAdapter(writer);
-      const out = await orchestrator.runSubagentPhase({ state, binding, model, tools: params.tools, tool_choice: params.tool_choice, sink, traceId, abort_signal });
+      const out = await orchestrator.runSubagentPhase({ state, binding, model, tools: params.tools, tool_choice: params.tool_choice, sink, traceId, abort_signal, passthrough: params.passthrough });
       finalizeAiStream(writer, 'complete');
       reply.raw.write('data: [DONE]\n\n');
       reply.raw.end();
       log.info(`subagent phase done (stream): phase=${binding.phase} agent_id=${binding.agentId} output_len=${out.content.length} frames=${writer.frames} elapsed=${Date.now() - start}ms`);
     } else {
-      const out = await orchestrator.runSubagentPhase({ state, binding, model, tools: params.tools, tool_choice: params.tool_choice, traceId, abort_signal });
+      const out = await orchestrator.runSubagentPhase({ state, binding, model, tools: params.tools, tool_choice: params.tool_choice, traceId, abort_signal, passthrough: params.passthrough });
       reply.send({
         id: `chatcmpl-${Date.now().toString(36)}`,
         object: 'chat.completion',
@@ -809,7 +820,35 @@ async function handleStream(
   return undefined;
 }
 
-/** First user/system message text — the natural-language instruction for the loop. */
+/**
+ * ADR A-007 (passthrough-intacto): the client request's body, verbatim, minus the fields the
+ * proxy itself transforms (`messages` — rebuilt per phase, `model` — alias-resolved, `stream` —
+ * SDK-managed, `tools`/`tool_choice` — converted to the SDK shape) and the evolve proxy controls
+ * (proxy directives, not model API parameters). Every surviving field is forwarded to the upstream
+ * unchanged on every call the proxy makes for this request. `undefined` values are dropped (they
+ * are absent from the wire anyway).
+ */
+const RESERVED_BODY_KEYS: ReadonlySet<string> = new Set([
+  'model',
+  'messages',
+  'stream',
+  'tools',
+  'tool_choice',
+  'max_rounds',
+  'max_retries',
+  'doom_loop_threshold',
+  'context_window_size',
+]);
+
+function buildPassthrough(body: Record<string, unknown>): Record<string, unknown> {
+  const out: Record<string, unknown> = {};
+  for (const [key, value] of Object.entries(body ?? {})) {
+    if (RESERVED_BODY_KEYS.has(key) || value === undefined) continue;
+    out[key] = value;
+  }
+  return out;
+}
+
 /**
  * Build the natural-language instruction for the loop: the full system prompt (all `system`
  * turns, in order) followed by the first `user` turn's content. The agent must act on both —

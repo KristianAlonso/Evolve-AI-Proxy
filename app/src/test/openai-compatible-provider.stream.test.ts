@@ -131,7 +131,7 @@ describe('OpenAICompatibleProvider.complete (SC-025)', () => {
     expect(res.refused).toBe(false);
   });
 
-  it('forwards caller max_tokens / temperature into the v4 call options (bug fix: previously dropped)', async () => {
+  it('forwards passthrough max_tokens / temperature into the v4 call options (ADR A-007)', async () => {
     let capturedOptions: Record<string, unknown> = {};
     const captureClient: ProviderClient = {
       chatModel: () => ({
@@ -148,14 +148,106 @@ describe('OpenAICompatibleProvider.complete (SC-025)', () => {
     };
     const provider = new OpenAICompatibleProvider('http://upstream.test', 'sk-test', () => captureClient);
 
-    await provider.complete(MODEL, MESSAGES, { temperature: 0.7, max_tokens: 256 });
+    await provider.complete(MODEL, MESSAGES, { passthrough: { temperature: 0.7, max_tokens: 256 } });
 
     // The SDK maps these v4 keys into the upstream request body (max_tokens / temperature).
     expect(capturedOptions.maxOutputTokens).toBe(256);
     expect(capturedOptions.temperature).toBe(0.7);
   });
 
-  it('leaves call options undefined when the caller passes neither max_tokens nor temperature', async () => {
+  it('forwards EVERY other passthrough field raw via providerOptions (ADR A-007 verbatim)', async () => {
+    let capturedOptions: Record<string, unknown> = {};
+    const captureClient: ProviderClient = {
+      chatModel: () => ({
+        doGenerate: async (opts: any) => {
+          capturedOptions = opts;
+          return {
+            content: [{ type: 'text', text: 'ok' }],
+            finishReason: { unified: 'stop' as const, raw: undefined },
+            usage: { inputTokens: { total: 1, noCache: 0, cacheRead: 0, cacheWrite: 0 }, outputTokens: { total: 1, text: 0, reasoning: 0 }, raw: undefined },
+          } as unknown as V4ChatModel;
+        },
+        doStream: async () => ({ stream: (async function* () {})() }),
+      }) as unknown as V4ChatModel,
+    };
+    const provider = new OpenAICompatibleProvider('http://upstream.test', 'sk-test', () => captureClient);
+
+    await provider.complete(MODEL, MESSAGES, {
+      passthrough: {
+        top_p: 0.9,
+        top_k: 5,
+        seed: 42,
+        stop: ['end'],
+        logprobs: true,
+        stream_options: { include_usage: true },
+        user: 'client-1',
+        metadata: { origin: 'opencode' },
+        parallel_tool_calls: false,
+        reasoning_effort: 'high',
+        max_completion_tokens: 4096,
+      },
+    });
+
+    // Recognized fields map to v4 options (the SDK knows their OpenAI body names)...
+    expect(capturedOptions.topP).toBe(0.9);
+    expect(capturedOptions.seed).toBe(42);
+    expect(capturedOptions.stopSequences).toEqual(['end']);
+    // ...the client's reasoning_effort rides the v4 `reasoning` (custom-reasoning string) path —
+    // the SDK writes it verbatim into the body's `reasoning_effort` field.
+    expect(capturedOptions.reasoning).toBe('high');
+    // ...everything else rides raw, untouched, under the stable provider namespace — the SDK
+    // spreads these verbatim into the upstream request body.
+    const raw = (capturedOptions.providerOptions as Record<string, Record<string, unknown>>).evolve_upstream;
+    expect(raw).toEqual({
+      top_k: 5,
+      logprobs: true,
+      stream_options: { include_usage: true },
+      user: 'client-1',
+      metadata: { origin: 'opencode' },
+      parallel_tool_calls: false,
+      max_completion_tokens: 4096,
+    });
+  });
+
+  it('never forwards reserved client fields (messages/model/stream/tools/tool_choice/evolve controls)', async () => {
+    let capturedOptions: Record<string, unknown> = {};
+    const captureClient: ProviderClient = {
+      chatModel: () => ({
+        doGenerate: async (opts: any) => {
+          capturedOptions = opts;
+          return {
+            content: [{ type: 'text', text: 'ok' }],
+            finishReason: { unified: 'stop' as const, raw: undefined },
+            usage: { inputTokens: { total: 1, noCache: 0, cacheRead: 0, cacheWrite: 0 }, outputTokens: { total: 1, text: 0, reasoning: 0 }, raw: undefined },
+          } as unknown as V4ChatModel;
+        },
+        doStream: async () => ({ stream: (async function* () {})() }),
+      }) as unknown as V4ChatModel,
+    };
+    const provider = new OpenAICompatibleProvider('http://upstream.test', 'sk-test', () => captureClient);
+
+    await provider.complete(MODEL, MESSAGES, {
+      passthrough: {
+        model: 'alias/name',
+        messages: [{ role: 'user', content: 'x' }],
+        stream: true,
+        tools: [{ type: 'function', function: { name: 't', parameters: {} } }],
+        tool_choice: 'auto',
+        max_rounds: 3,
+        doom_loop_threshold: 2,
+      },
+      tools: [{ type: 'function', function: { name: 'real', parameters: {} } }],
+    });
+
+    // Reserved keys are transformed (model/messages), SDK-managed (stream), or proxy controls —
+    // they must NOT appear raw in the forwarded options...
+    const raw = (capturedOptions.providerOptions as Record<string, Record<string, unknown>> | undefined)?.evolve_upstream;
+    expect(raw).toBeUndefined();
+    // ...and the client's real tools ride the converted path (not the reserved one).
+    expect((capturedOptions.tools as any[]).map((t) => t.name)).toEqual(['real']);
+  });
+
+  it('leaves call options empty when there is no passthrough (no invented values)', async () => {
     let capturedOptions: Record<string, unknown> = {};
     const captureClient: ProviderClient = {
       chatModel: () => ({
@@ -174,8 +266,10 @@ describe('OpenAICompatibleProvider.complete (SC-025)', () => {
 
     await provider.complete(MODEL, MESSAGES, {});
 
+    // The proxy never invents values: no client field -> no forwarded option.
     expect(capturedOptions.maxOutputTokens).toBeUndefined();
     expect(capturedOptions.temperature).toBeUndefined();
+    expect(capturedOptions.providerOptions).toBeUndefined();
   });
 
   it('maps a content-filter finish reason to refused=true', async () => {

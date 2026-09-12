@@ -76,6 +76,8 @@ export class SubagentOrchestrator {
     makeSink?: () => LoopSink | undefined;
     traceId?: string;
     abort_signal?: AbortSignal;
+    /** ADR A-007 (passthrough-intacto): the client's request parameters, forwarded as-is. */
+    passthrough?: Record<string, unknown>;
   }): Promise<{ outcome: OrchestratorOutcome; sink?: LoopSink } | null> {
     const { state, sessionId, model } = args;
 
@@ -84,6 +86,7 @@ export class SubagentOrchestrator {
       logger: this.logger,
       traceId: args.traceId,
       abort_signal: args.abort_signal,
+      passthrough: args.passthrough,
     });
     if (!spec) return null;
     state.spec = spec;
@@ -99,7 +102,7 @@ export class SubagentOrchestrator {
       this.provider,
       state.internalMessages,
       () => '',
-      { model, logger: this.logger, traceId: args.traceId, abort_signal: args.abort_signal },
+      { model, logger: this.logger, traceId: args.traceId, abort_signal: args.abort_signal, passthrough: args.passthrough },
       sink,
     );
     state.totalUpstreamCalls += 1;
@@ -233,6 +236,8 @@ export class SubagentOrchestrator {
     sink?: LoopSink;
     traceId?: string;
     abort_signal?: AbortSignal;
+    /** ADR A-007 (passthrough-intacto): the client's request parameters, forwarded as-is. */
+    passthrough?: Record<string, unknown>;
   }): Promise<{ content: string; reasoning: string }> {
     const { state, binding, model } = args;
     const { agentId, phase } = binding;
@@ -278,6 +283,7 @@ export class SubagentOrchestrator {
             logger: this.logger,
             trace_id: args.traceId,
             abort_signal: args.abort_signal,
+            passthrough: args.passthrough,
           },
           surfaceDelta: args.sink
             ? (chunk) => {
@@ -305,7 +311,7 @@ export class SubagentOrchestrator {
         provider: this.provider,
         model,
         messages: prompt,
-        options: { logger: this.logger, trace_id: args.traceId, abort_signal: args.abort_signal },
+        options: { logger: this.logger, trace_id: args.traceId, abort_signal: args.abort_signal, passthrough: args.passthrough },
         surfaceDelta: args.sink
           ? (chunk) => {
               const reasoning = typeof chunk.reasoning === 'string' ? chunk.reasoning : '';

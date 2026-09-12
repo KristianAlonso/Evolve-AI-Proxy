@@ -166,3 +166,13 @@ Wire 100% `chat.completion.chunk` (reasoning/thinking + content + tool_calls + f
 **Verificación:** 4 tests unitarios de `detectTypeDrift` + 1 test de re-mapeo (spawn con el nuevo tipo). **Live (HTTP directo):** start con `enum=[plan,build]` → mapeo `type="build"` → spawn `type=build`; resume con el mismo enum → **sin** re-mapeo (0.0 s, sin upstream); resume con `enum=[fresh,new]` → `WARN subagent type list drifted (previous type="build" no longer exists) — remapped type="new"` → spawn `type=new`.
 
 **Docs:** ADR (sección de drift + riesgo + evidencia #5) y `AGENTS.md` actualizados.
+
+## Follow-up: ADR A-007 — Passthrough-intacto (2026-09-12)
+
+**Cambio:** el proxy reenvía al upstream la petición del cliente **verbatim** (solo `messages` y `model` se transforman). Se eliminaron los `max_tokens` forzados (8192 mapper / 512 interpreter / 128 evaluator): lo que el cliente no envió, el proxy no lo inventa.
+
+**Implementación:** `buildPassthrough(body)` en `routes.ts` (cosecha todo salvo `RESERVED_BODY_KEYS`) → `passthrough: Record<string, unknown>` viaja por todo el pipeline → `buildForwardOptions()` en `openai-compatible-provider.ts` (campos estándar → opciones v4; `reasoning_effort` → `reasoning` custom-string; resto → `providerOptions[PROVIDER_NAME='evolve_upstream']` = spread verbatim del SDK).
+
+**Verificación:** 13 tests unitarios nuevos (fake SDK client) + wire-test con dump upstream (`tmp-oc/dump-upstream.ts`): 16 campos client → todos verbatim en el body upstream. Live contra LiteLLM: `temperature/top_p/seed/max_tokens/user/metadata` presentes en las 3 llamadas del bucle. Suite 93/93.
+
+**Docs:** [`docs/adr/a-007-passthrough-intacto.md`](../docs/adr/a-007-passthrough-intacto.md) + índice ADRs.

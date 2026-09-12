@@ -34,6 +34,10 @@ request → Interpretar → Planificar → Ejecutar → Evaluar → (condensar c
   muerto) y el bucle se detiene sin reintentos.
 - **Safety** — auto-healing con reintentos (falla rápido en errores deterministas: contexto
   excedido, auth, 4xx), detección de doom-loops, control de ventanas de contexto.
+- **Passthrough-intacto** (ADR A-007) — el upstream recibe la petición del cliente verbatim
+  (`temperature`, `top_p`, `seed`, `top_k`, `stop`, `logprobs`, `response_format`, `user`,
+  `metadata`, …). Solo `messages` (inyección de fase) y `model` (alias) se transforman.
+  Sin valores inventados: si el cliente no envió un campo, no se le envía.
 
 ## Estructura
 

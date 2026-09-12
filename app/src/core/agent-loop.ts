@@ -61,6 +61,12 @@ export interface LoopOptions {
    * call is cancelled and the loop breaks at the next checkpoint without wasting retries.
    */
   abort_signal?: AbortSignal;
+  /**
+   * ADR A-007 (passthrough-intacto): the client request's body fields, verbatim (minus
+   * messages/model/stream/tools/tool_choice and the evolve controls). Every upstream call the loop
+   * makes forwards them so the model sees the SAME request shape the client sent.
+   */
+  passthrough?: Record<string, unknown>;
 }
 
 export interface LoopTrace {
@@ -166,12 +172,12 @@ export class AgentLoop {
         this.countCall('interpret');
         let interp;
         try {
-          interp = await interpretRequest(this.provider, this.fellBackToRendered ? [...renderedInternal] : [...structuredInternal], () => '', { model: o.model, logger: this.logger, traceId: o.traceId, abort_signal: o.abort_signal }, this.sink);
+          interp = await interpretRequest(this.provider, this.fellBackToRendered ? [...renderedInternal] : [...structuredInternal], () => '', { model: o.model, logger: this.logger, traceId: o.traceId, abort_signal: o.abort_signal, passthrough: o.passthrough }, this.sink);
         } catch (err) {
           if (!this.fellBackToRendered && isStructuredRejection(err) && !isAbortError(err) && !o.abort_signal?.aborted) {
             this.fellBackToRendered = true;
             this.logger.warn('interpret: upstream rejected structured conversation — retrying with rendered (flat) conversation');
-            interp = await interpretRequest(this.provider, [...renderedInternal], () => '', { model: o.model, logger: this.logger, traceId: o.traceId, abort_signal: o.abort_signal }, this.sink);
+            interp = await interpretRequest(this.provider, [...renderedInternal], () => '', { model: o.model, logger: this.logger, traceId: o.traceId, abort_signal: o.abort_signal, passthrough: o.passthrough }, this.sink);
           } else {
             throw err;
           }
@@ -202,7 +208,7 @@ export class AgentLoop {
         const makeExecuteStep = (prompt: UpstreamMessage[]): ExecStep => async () => {
           // The provider call options carry the delegated client tools (FASE 2); interpretation /
           // planning / evaluation never receive them.
-          const callOptions = { tools: o.tools, tool_choice: o.tool_choice, logger: this.logger, trace_id: o.traceId, abort_signal: o.abort_signal };
+          const callOptions = { tools: o.tools, tool_choice: o.tool_choice, logger: this.logger, trace_id: o.traceId, abort_signal: o.abort_signal, passthrough: o.passthrough };
 
           // Counted BEFORE the call: a failed upstream call is still an upstream call — the metric
           // must reflect what left the proxy (the deterministic-error path threw before the old
@@ -327,7 +333,7 @@ export class AgentLoop {
         // whole-text emit so no tracing is lost when the provider cannot stream.
         const evalT0 = Date.now();
         this.countCall('evaluate');
-        const evalCall = await evaluateTask(this.provider, originalInstruction, this.accumulatedSummary(accumulatedSteps), result, { model: o.model, logger: this.logger, traceId: o.traceId, abort_signal: o.abort_signal }, this.sink);
+        const evalCall = await evaluateTask(this.provider, originalInstruction, this.accumulatedSummary(accumulatedSteps), result, { model: o.model, logger: this.logger, traceId: o.traceId, abort_signal: o.abort_signal, passthrough: o.passthrough }, this.sink);
         this.logger.info(`evaluate (round ${round + 1}): ${Date.now() - evalT0}ms decision=${evalCall.decision}`);
         if (this.sink) {
           if (evalCall.streamed) {
@@ -410,6 +416,7 @@ export class AgentLoop {
       tool_choice: this.opts.tool_choice,
       traceId: this.opts.traceId,
       abort_signal: this.opts.abort_signal,
+      passthrough: this.opts.passthrough,
     };
   }
 
@@ -464,7 +471,7 @@ export class AgentLoop {
       provider: this.provider,
       model: this.opts.model ?? null,
       messages: prompt,
-      options: { logger: this.logger, trace_id: this.opts.traceId, abort_signal: this.opts.abort_signal },
+      options: { logger: this.logger, trace_id: this.opts.traceId, abort_signal: this.opts.abort_signal, passthrough: this.opts.passthrough },
       surfaceDelta: this.sink
         ? (chunk) => {
             const reasoning = typeof chunk.reasoning === 'string' ? chunk.reasoning : '';
