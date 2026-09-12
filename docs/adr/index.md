@@ -11,6 +11,7 @@ Registro de decisiones arquitecturales que han dado forma al diseño y la evoluc
 | [A-003](./a-003-patron-agentico-iterativo.md) | Patrón Agéntico Iterativo | **Aceptada** | Sistema de interpretación → planificación → ejecución → evaluación en bucle controlado para resolver solicitudes complejas. |
 | [A-006](./a-006-subagent-phase-delegation.md) | Delegación de Fases a Subagentes | **Aceptada** | Las fases planificar/ejecutar/evaluar se delegan al cliente vía tool call de spawn (formato OpenAI estándar); estado serializable en `SessionStore`; degradación segura al bucle inline. |
 | [A-007](./a-007-passthrough-intacto.md) | Passthrough-Intacto de la Petición | **Aceptada** | El proxy reenvía al upstream la petición del cliente verbatim (salvo `messages` y `model`); sin valores inventados (eliminan los `max_tokens` forzados 512/128/8192); campos estándar mapeados a opciones v4, el resto via `providerOptions` raw del SDK. |
+| [A-008](./a-008-phase-prompt-shaping.md) | Phase-Prompt Shaping | **Aceptada** | Toda llamada upstream de fase usa una forma canónica: conversación del cliente intacta (sin `system` añadidos) + el último mensaje intermedio (un turno `assistant`) + la instrucción de fase al final (`user`). Elimina el `ContextManager` y la acumulación de contexto; inline y orquestador comparten la misma forma. |
 
 ## Formato de los ADRs
 

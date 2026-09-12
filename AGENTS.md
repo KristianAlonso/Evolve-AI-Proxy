@@ -50,6 +50,19 @@ El proxy no es un simple relé — es un **sistema agéntico iterativo** que:
 
 **Componentes clave:** `Interpreter`, `Planner`, `Executor`, `Evaluator`, `LoopController`
 
+### A-008: Phase-Prompt Shaping
+
+Toda llamada upstream de una fase del bucle (inline u orquestador) usa **una sola forma canónica** (`buildPhasePrompt` en `src/core/phase-prompts.ts`):
+
+```text
+[ ...baseCliente(intacta), ...(lastMessage ? [{role:'assistant', content:lastMessage}] : []), {role:'user', content:instruction} ]
+```
+
+- El `system` del cliente se conserva byte a byte; el proxy **nunca añade `system`** — las instrucciones de fase van al final como `user`.
+- **Solo se conserva el último mensaje intermedio** (la salida cruda de la última fase, un único turno `assistant`); el historial de fases anterior se descarta — sin `ContextManager`.
+- Inline (`AgentLoop`) y orquestador (`SubagentOrchestrator`, FASE 6) comparten los mismos builders; el fallback sticky estructur→rendered (4xx) se aplica a todas las fases.
+- Detalle: [docs/adr/a-008-phase-prompt-shaping.md](./docs/adr/a-008-phase-prompt-shaping.md)
+
 ## Estructura de carpetas (provisional)
 
 ```text
@@ -131,5 +144,5 @@ Además del bucle inline, el proxy puede **delegar las fases planificar/ejecutar
 | [README.md](./README.md) | Documentación completa del proxy (arquitectura, streaming, FASE 6, configuración) |
 | [LICENSE.md](./LICENSE.md) | Apache 2.0 |
 | [CONTRIBUTING.md](./CONTRIBUTING.md) | No existe |
-| [docs/adr/index.md](./docs/adr/index.md) | Índice de decisiones arquitecturales (A-001…A-006) |
+| [docs/adr/index.md](./docs/adr/index.md) | Índice de decisiones arquitecturales (A-001…A-008) |
 | [plans/subagent-phase-delegation.md](./plans/subagent-phase-delegation.md) | Plan FASE 6 — Delegación de fases a subagentes |

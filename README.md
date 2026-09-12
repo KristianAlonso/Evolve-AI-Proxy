@@ -38,6 +38,11 @@ request → Interpretar → Planificar → Ejecutar → Evaluar → (condensar c
   (`temperature`, `top_p`, `seed`, `top_k`, `stop`, `logprobs`, `response_format`, `user`,
   `metadata`, …). Solo `messages` (inyección de fase) y `model` (alias) se transforman.
   Sin valores inventados: si el cliente no envió un campo, no se le envía.
+- **Phase-prompt shaping** (ADR A-008) — toda llamada upstream de fase usa una forma
+  canónica: conversación del cliente intacta (el proxy nunca añade `system`) + el último
+  mensaje intermedio (un turno `assistant`, la salida cruda de la última fase) + la
+  instrucción de fase al final (`user`). Sin acumulación ni compresión de historial de
+  fases; inline y orquestador comparten la misma forma.
 
 ## Estructura
 
