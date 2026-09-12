@@ -1,5 +1,6 @@
 import { describe, it, expect } from 'vitest';
 import { interpretRequest, formatInterpretationTrace } from '../core/interpreter.js';
+import { buildPhasePrompt, INTERPRET_INSTRUCTION } from '../core/phase-prompts.js';
 import type { ChatProvider } from '../provider/types.js';
 import { resp } from './stub-provider.js';
 
@@ -16,7 +17,7 @@ const provider: ChatProvider = {
 
 describe('interpreter (SC-003/004)', () => {
   it('parses a structured JSON interpretation', async () => {
-    const { interpretation, reasoning } = await interpretRequest(provider, [{ role: 'user', content: 'Build X' }] as any, () => '', { model: null });
+    const { interpretation, reasoning } = await interpretRequest(provider, buildPhasePrompt([{ role: 'user', content: 'Build X' }], null, INTERPRET_INSTRUCTION), { model: null });
     expect(interpretation.mainObjective).toBe('Build X');
     expect(interpretation.subObjectives).toEqual(['a', 'b']);
     expect(interpretation.resourcesNeeded).toEqual(['db']);
@@ -25,7 +26,7 @@ describe('interpreter (SC-003/004)', () => {
 
   it('falls back to mainObjective when the body is not JSON', async () => {
     const loose: ChatProvider = { ...provider, complete: async () => resp({ content: 'just a sentence with no braces' }) };
-    const { interpretation } = await interpretRequest(loose, [{ role: 'user', content: 'x' }] as any, () => '', { model: null });
+    const { interpretation } = await interpretRequest(loose, buildPhasePrompt([{ role: 'user', content: 'x' }], null, INTERPRET_INSTRUCTION), { model: null });
     expect(interpretation.mainObjective).toBe('just a sentence with no braces');
     expect(interpretation.subObjectives.length).toBe(0);
   });

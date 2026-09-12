@@ -2,7 +2,7 @@
 // Asks the model whether a task is complete and normalizes the answer to yes/no.
 
 import type { ChatProvider } from '../provider/types.js';
-import type { NormalizedResult, UpstreamMessage, TaskResult } from '../types.js';
+import type { NormalizedResult, UpstreamMessage } from '../types.js';
 import { callWithStreaming, type LiveEmitter } from './stream-helper.js';
 import type { TraceLogger } from '../logger.js';
 
@@ -24,45 +24,21 @@ export function classifyEvaluation(answer: string): { decision: 'complete' | 'co
   return { decision: isYes ? 'complete' : 'continue', normalized: clean.slice(0, 240) };
 }
 
-/** Build the evaluate prompt from original instruction + accumulated context + result (SC-007). */
-export function buildEvaluatePrompt(originalInstruction: string, accumulatedContext: string, taskResult: TaskResult): UpstreamMessage[] {
-  const summary =
-    taskResult.status === 'completed' ? taskResult.output : `(failed after ${taskResult.attempts} attempt(s))`;
-  return [
-    {
-      role: 'system',
-      content:
-        'You are the evaluator of an agent loop. Reply with ONLY JSON.',
-    },
-    {
-      role: 'user',
-      content: [
-        `Original instruction: ${originalInstruction}`,
-        '',
-        `Accumulated context so far:\n${accumulatedContext}`,
-        '',
-        `Task result summary:\n${summary}`,
-        '',
-        'Reply with EXACTLY one of: {"complete": true} or {"complete": false}.',
-      ].join('\n'),
-    },
-  ];
-}
-
-/** Run the binary evaluation against the model. */
+/** Run the binary evaluation against the model. ADR A-008: the caller builds the FULL prompt
+ *  (`buildPhasePrompt(base, lastMessage, buildEvaluateInstruction(originalInstruction))`) — the
+ *  task result is the assistant message right before the instruction. No system message is added
+ *  here; the raw answer is returned (`raw`) so the caller can keep it as the last intermediate
+ *  message of the process. */
 export async function evaluateTask(
   provider: ChatProvider,
-  originalInstruction: string,
-  accumulatedContext: string,
-  taskResult: TaskResult,
+  messages: UpstreamMessage[],
   options?: { model: string | null; logger?: TraceLogger; traceId?: string; abort_signal?: AbortSignal; passthrough?: Record<string, unknown> },
   emitter?: LiveEmitter,
-): Promise<{ decision: 'complete' | 'continue'; reasoning: string; streamed: boolean }> {
-  const prompt = buildEvaluatePrompt(originalInstruction, accumulatedContext, taskResult);
+): Promise<{ decision: 'complete' | 'continue'; reasoning: string; raw: string; streamed: boolean }> {
   const { result, streamed } = await callWithStreaming({
     provider,
     model: options?.model ?? null, // concrete user-selected model — never "auto" (no-auto rule)
-    messages: prompt,
+    messages,
     // ADR A-007 (passthrough-intacto): no invented max_tokens budget — the client's request
     // parameters are forwarded exactly as sent; no client value means no field in the upstream call.
     options: { passthrough: options?.passthrough, logger: options?.logger, trace_id: options?.traceId, abort_signal: options?.abort_signal },
@@ -71,14 +47,15 @@ export async function evaluateTask(
       if (reasoning !== '') emitter.emitReasoningDelta(0, reasoning);
     } : undefined,
   });
-  const answer = result.content?.trim() || '';
+  const raw = result.content?.trim() || '';
   // If the model produced no usable content, treat as "continue".
-  if (!answer) return { decision: 'continue', reasoning: result.reasoning, streamed };
+  if (!raw) return { decision: 'continue', reasoning: result.reasoning, raw, streamed };
 
-  const classification = classifyEvaluation(answer);
+  const classification = classifyEvaluation(raw);
   return {
     decision: classification.decision,
     reasoning: `${result.reasoning}\nnormalized: ${classification.normalized}`,
+    raw,
     streamed,
   };
 }

@@ -7,19 +7,19 @@ import { isAbortError } from '../provider/types.js';
 import type { ChatProvider } from '../provider/types.js';
 import { createLogger, type TraceLogger } from '../logger.js';
 import type { Phase, SSEEvent } from '../sse-writer.js';
-import type { AgentTask, LoopDecision, TaskResult, ToolCall, ToolChoice, ToolDefinition, UpstreamMessage } from '../types.js';
+import type { AgentTask, ContextStep, LoopDecision, TaskResult, ToolCall, ToolChoice, ToolDefinition, UpstreamMessage } from '../types.js';
 import { interpretRequest, type Interpretation } from './interpreter.js';
 import { generateTasks } from './task-generator.js';
 import { evaluateTask } from './evaluator.js';
 import { callWithStreaming } from './stream-helper.js';
 import { withAutoHealingRetry } from '../safety/auto-healing-retry.js';
-import { ContextManager, type ContextStep } from './context-manager.js';
 import { detectDoomLoop, type DoomLoopResult } from '../safety/doom-loop-detector.js';
 import {
-  buildPlanifyPrompt,
-  buildRenderedExecutePrompt,
-  buildStructuredExecutePrompt,
+  buildEvaluateInstruction,
+  buildPhasePrompt,
+  buildPlanifyInstruction,
   goalHintForPlanify,
+  INTERPRET_INSTRUCTION,
   isStructuredRejection,
   toInternalMessages,
   toRenderedMessages,
@@ -107,7 +107,15 @@ export class AgentLoop {
   /** R1 (FASE 6): sticky after a 4xx rejection of the structured assistant history — every later
    *  phase of this run uses the rendered (flat) conversation/prompt shape. */
   private fellBackToRendered = false;
-  private ctxManager = new ContextManager(4096);
+  /** Client conversation in both shapes (set at run() start; ADR A-008 base of every prompt). */
+  private structuredInternal: UpstreamMessage[] = [];
+  private renderedInternal: UpstreamMessage[] = [];
+  /**
+   * ADR A-008: the ONLY intermediate message kept in the global process — the raw content of the
+   * LAST upstream phase response. Every phase prompt is base + (this, as one `assistant` turn) +
+   * the phase instruction (user, appended at the end). Updated after every phase.
+   */
+  private lastMessage: string | null = null;
   private phaseSet = new Set<Phase>();
   /** Live upstream-call counter (SC-018). */
   totalUpstreamCalls = 0;
@@ -116,7 +124,6 @@ export class AgentLoop {
     this.provider = provider;
     this.sink = sink;
     this.opts = opts;
-    this.ctxManager.setWindowSize(opts.context_window_size ?? 4096);
     this.logger = opts.logger ?? createLogger('loop');
   }
 
@@ -145,8 +152,12 @@ export class AgentLoop {
     // to the model as REAL assistant/tool turns — the model's own history is its own history. For
     // upstreams that reject that shape (4xx, e.g. Vertex thought_signatures) we retry ONCE with
     // the rendered (flat) version and stay on it for the rest of the run (fellBackToRendered).
-    const structuredInternal = toInternalMessages(messages);
-    const renderedInternal = toRenderedMessages(messages);
+    // ADR A-008: the client's conversation is the base of EVERY phase prompt, untouched. Both
+    // shapes are prepared up front: structured (roles preserved — assistant/tool turns travel as
+    // they came) and rendered (flat 4xx fallback, sticky once triggered via fellBackToRendered).
+    this.structuredInternal = toInternalMessages(messages);
+    this.renderedInternal = toRenderedMessages(messages);
+    this.lastMessage = null; // intermediate API messages are NOT kept — only the last one is
 
     for (; round < o.max_rounds; round++) {
       try {
@@ -170,18 +181,11 @@ export class AgentLoop {
         // fallback emit below would duplicate what already left on the wire — skip it then.
         const interpT0 = Date.now();
         this.countCall('interpret');
-        let interp;
-        try {
-          interp = await interpretRequest(this.provider, this.fellBackToRendered ? [...renderedInternal] : [...structuredInternal], () => '', { model: o.model, logger: this.logger, traceId: o.traceId, abort_signal: o.abort_signal, passthrough: o.passthrough }, this.sink);
-        } catch (err) {
-          if (!this.fellBackToRendered && isStructuredRejection(err) && !isAbortError(err) && !o.abort_signal?.aborted) {
-            this.fellBackToRendered = true;
-            this.logger.warn('interpret: upstream rejected structured conversation — retrying with rendered (flat) conversation');
-            interp = await interpretRequest(this.provider, [...renderedInternal], () => '', { model: o.model, logger: this.logger, traceId: o.traceId, abort_signal: o.abort_signal, passthrough: o.passthrough }, this.sink);
-          } else {
-            throw err;
-          }
-        }
+        const interp = await this.withShapeFallback((rendered) =>
+          interpretRequest(this.provider, this.phasePrompt(rendered, INTERPRET_INSTRUCTION), { model: o.model, logger: this.logger, traceId: o.traceId, abort_signal: o.abort_signal, passthrough: o.passthrough }, this.sink),
+        );
+        // ADR A-008: the interpreter's raw reply becomes the process' last intermediate message.
+        this.lastMessage = interp.raw || null;
         if (this.sink && !interp.streamed) this.sink.emitReasoning(0, interp.reasoning || interp.interpretation.mainObjective);
         this.logger.info(
           `interpret (round ${round + 1}): ${Date.now() - interpT0}ms objective="${interp.interpretation.mainObjective.replace(/\s+/g, ' ').slice(0, 160)}" ` +
@@ -194,18 +198,16 @@ export class AgentLoop {
         // ---- Planning / task selection. Consume pre-generated tasks in order, refine when out. ----
         this.emitPhase('planning', { step: 'planify' });
         const planT0 = Date.now();
-        const task = tasks[round] ?? await this.planify(goalHintForPlanify(originalInstruction, lastOutput));
+        const task = tasks[round] ?? await this.planify(goalHintForPlanify(originalInstruction, lastOutput), o);
         this.logger.info(`plan (round ${round + 1}): ${Date.now() - planT0}ms task="${task.description.replace(/\s+/g, ' ').slice(0, 160)}"`);
         trace.push({ iteration: round + 1, phase: 'planning', task_id: task.id, content: task.description });
 
         // ---- Execute with auto-healing + doom-loop guard (SC-012/013/014). ----
         this.emitPhase('executing_task', { step: `execute #${round + 1}` });
-        // R1 (FASE 6): previous step outputs ride as real assistant turns (structured prompt);
-        // the rendered (flat) shape is the 4xx fallback. Both share the same task content.
+        // ADR A-008: progress is NOT a step list — the previous phase's output already rides as
+        // the single `assistant` turn in the base; the prompt ends on the task instruction (user).
         const taskContent = this.buildExecuteContent(task, messages);
-        const structuredPrompt = buildStructuredExecutePrompt(originalInstruction, accumulatedSteps, taskContent);
-        const renderedPrompt = buildRenderedExecutePrompt(originalInstruction, accumulatedSteps, taskContent);
-        const makeExecuteStep = (prompt: UpstreamMessage[]): ExecStep => async () => {
+        const makeExecuteStep = (rendered: boolean): ExecStep => async () => {
           // The provider call options carry the delegated client tools (FASE 2); interpretation /
           // planning / evaluation never receive them.
           const callOptions = { tools: o.tools, tool_choice: o.tool_choice, logger: this.logger, trace_id: o.traceId, abort_signal: o.abort_signal, passthrough: o.passthrough };
@@ -217,7 +219,7 @@ export class AgentLoop {
 
           // No watcher, or a provider without completeStream (unit-test stubs): fully buffered call.
           if (!this.sink) {
-            const res = await this.provider.complete(o.model, prompt, callOptions);
+            const res = await this.provider.complete(o.model, this.phasePrompt(rendered, taskContent), callOptions);
             return { output: res.content ?? '', reasoning: res.reasoning || '', doomedLoop: { detected: false, repetitions: 0 }, tool_calls: res.tool_calls };
           }
 
@@ -232,7 +234,7 @@ export class AgentLoop {
           const { result } = await callWithStreaming({
             provider: this.provider,
             model: o.model,
-            messages: prompt,
+            messages: this.phasePrompt(rendered, taskContent),
             options: callOptions,
             surfaceDelta: (chunk) => {
               const reasoning = typeof chunk.reasoning === 'string' ? chunk.reasoning : '';
@@ -257,7 +259,7 @@ export class AgentLoop {
         let outcome;
         const execT0 = Date.now();
         try {
-          outcome = await this.runExecuteWithFallback(makeExecuteStep, structuredPrompt, renderedPrompt, round, o);
+          outcome = await this.runExecuteWithFallback(makeExecuteStep, round, o);
         } catch (err) {
           if (isAbortError(err) || o.abort_signal?.aborted) {
             this.logger.warn(`execute aborted (round ${round + 1}): ${Date.now() - execT0}ms — stopped per client request`);
@@ -317,6 +319,7 @@ export class AgentLoop {
         }
 
         lastOutput = result.output;
+        // Metadata only (final response / trace) — never carried into the next prompt (A-008).
         const step: ContextStep = {
           iteration: round + 1,
           objective: interp.interpretation.mainObjective,
@@ -325,7 +328,8 @@ export class AgentLoop {
           successful: true,
         };
         accumulatedSteps.push(step);
-        this.ctxManager.record(step);
+        // ADR A-008: the execute output becomes the process' last intermediate message.
+        this.lastMessage = result.output || null;
 
         // ---- Binary evaluation (SC-007/008). ----
         this.emitPhase('evaluating', { step: `evaluate #${round + 1}` });
@@ -333,7 +337,12 @@ export class AgentLoop {
         // whole-text emit so no tracing is lost when the provider cannot stream.
         const evalT0 = Date.now();
         this.countCall('evaluate');
-        const evalCall = await evaluateTask(this.provider, originalInstruction, this.accumulatedSummary(accumulatedSteps), result, { model: o.model, logger: this.logger, traceId: o.traceId, abort_signal: o.abort_signal, passthrough: o.passthrough }, this.sink);
+        // ADR A-008: the evaluator judges the assistant turn right before its instruction — the
+        // execute output, kept as the process' last intermediate message. No context block.
+        const evalCall = await this.withShapeFallback((rendered) =>
+          evaluateTask(this.provider, this.phasePrompt(rendered, buildEvaluateInstruction(originalInstruction)), { model: o.model, logger: this.logger, traceId: o.traceId, abort_signal: o.abort_signal, passthrough: o.passthrough }, this.sink),
+        );
+        this.lastMessage = evalCall.raw || null;
         this.logger.info(`evaluate (round ${round + 1}): ${Date.now() - evalT0}ms decision=${evalCall.decision}`);
         if (this.sink) {
           if (evalCall.streamed) {
@@ -350,18 +359,10 @@ export class AgentLoop {
           break;
         }
 
-        // ---- Context condensing before generating the next task (SC-021). ----
-        if (this.ctxManager.shouldCondense()) {
-          const condensed = this.ctxManager.condense();
-          trace.push({ iteration: round + 1, phase: 'executing_task', content: `context condensed -> ${condensed.summary.length} chars` });
-          accumulatedSteps.splice(0, Math.max(0, accumulatedSteps.length - condensed.remainingSteps.length));
-          this.logger.info(`context condensed (round ${round + 1}): kept ${condensed.remainingSteps.length} steps, summary ${condensed.summary.length} chars`);
-        }
-
         // ---- Replenish the task queue from a fresh interpretation when we run out. ----
         if (round + 1 >= tasks.length) {
           const refined = await generateTasks(this.provider, originalInstruction, interp.interpretation);
-          tasks = refined.length > 1 ? refined : [await this.planify(goalHintForPlanify(originalInstruction, lastOutput))];
+          tasks = refined.length > 1 ? refined : [await this.planify(goalHintForPlanify(originalInstruction, lastOutput), o)];
         }
       } catch (err) {
         // Any upstream failure during interpretation, planning, execution or evaluation SC-014.
@@ -462,24 +463,54 @@ export class AgentLoop {
     return `Accumulated context:\n${parts}`;
   }
 
-  private async planify(goalHint: string): Promise<AgentTask> {
-    const prompt = buildPlanifyPrompt(goalHint);
+  private async planify(goalHint: string, o: ReturnType<AgentLoop['resolvedOptions']>): Promise<AgentTask> {
     this.countCall('planify');
     // FASE 1: planning reasoning also streams live to a watching client. The task-description JSON
     // is internal — only the thinking path is surfaced (same rule as interpretation/evaluation).
-    const { result } = await callWithStreaming({
-      provider: this.provider,
-      model: this.opts.model ?? null,
-      messages: prompt,
-      options: { logger: this.logger, trace_id: this.opts.traceId, abort_signal: this.opts.abort_signal, passthrough: this.opts.passthrough },
-      surfaceDelta: this.sink
-        ? (chunk) => {
-            const reasoning = typeof chunk.reasoning === 'string' ? chunk.reasoning : '';
-            if (reasoning !== '') this.sink?.emitReasoningDelta(0, reasoning);
-          }
-        : undefined,
-    });
-    return { id: `task-refine-${Date.now()}`, description: (result.content ?? '').trim(), context_needed: [] };
+    const { result } = await this.withShapeFallback((rendered) =>
+      callWithStreaming({
+        provider: this.provider,
+        model: o.model,
+        messages: this.phasePrompt(rendered, buildPlanifyInstruction(goalHint)),
+        options: { logger: this.logger, trace_id: o.traceId, abort_signal: o.abort_signal, passthrough: o.passthrough },
+        surfaceDelta: this.sink
+          ? (chunk) => {
+              const reasoning = typeof chunk.reasoning === 'string' ? chunk.reasoning : '';
+              if (reasoning !== '') this.sink?.emitReasoningDelta(0, reasoning);
+            }
+          : undefined,
+      }),
+    );
+    // ADR A-008: the planify reply becomes the process' last intermediate message.
+    this.lastMessage = (result.content ?? '').trim() || null;
+    const desc = (result.content ?? '').trim() || `Follow up on: ${goalHint.slice(0, 120)}`;
+    return { id: `task-refine-${Date.now()}`, description: desc, context_needed: [] };
+  }
+
+  /**
+   * ADR A-008: the ONLY conversation shape for any phase call — client base untouched, the last
+   * intermediate message as a single `assistant` turn, the instruction appended at the end (user).
+   */
+  private phasePrompt(rendered: boolean, instruction: string): UpstreamMessage[] {
+    return buildPhasePrompt(rendered ? this.renderedInternal : this.structuredInternal, this.lastMessage, instruction);
+  }
+
+  /**
+   * ADR A-008 / R1: run a phase call with the sticky structured→rendered fallback. On a 4xx
+   * rejection of the structured conversation shape (never on aborts or real content errors), flip
+   * to the rendered (flat) base and retry ONCE, sticky for the rest of the run.
+   */
+  private async withShapeFallback<T>(fn: (rendered: boolean) => Promise<T>): Promise<T> {
+    try {
+      return await fn(this.fellBackToRendered);
+    } catch (err) {
+      if (this.fellBackToRendered || isAbortError(err) || this.opts.abort_signal?.aborted || !isStructuredRejection(err)) {
+        throw err;
+      }
+      this.fellBackToRendered = true;
+      this.logger.warn('upstream rejected structured conversation — retrying with rendered (flat) conversation (sticky)');
+      return fn(true);
+    }
   }
 
   /**
@@ -489,22 +520,20 @@ export class AgentLoop {
    * untouched (the outer loop handles them).
    */
   private async runExecuteWithFallback(
-    makeExecuteStep: (prompt: UpstreamMessage[]) => ExecStep,
-    structured: UpstreamMessage[],
-    rendered: UpstreamMessage[],
+    makeExecuteStep: (rendered: boolean) => ExecStep,
     round: number,
     o: ReturnType<AgentLoop['resolvedOptions']>,
   ) {
     const retryOpts = { maxRetries: o.max_retries, doomLoopThreshold: o.doom_loop_threshold, abortSignal: o.abort_signal };
     try {
-      return await withAutoHealingRetry(makeExecuteStep(structured), retryOpts);
+      return await withAutoHealingRetry(makeExecuteStep(this.fellBackToRendered), retryOpts);
     } catch (err) {
       if (this.fellBackToRendered || isAbortError(err) || o.abort_signal?.aborted || !isStructuredRejection(err)) {
         throw err;
       }
       this.fellBackToRendered = true;
       this.logger.warn(`execute (round ${round + 1}): upstream rejected structured assistant history — retrying with rendered (flat) prompt`);
-      return await withAutoHealingRetry(makeExecuteStep(rendered), retryOpts);
+      return await withAutoHealingRetry(makeExecuteStep(true), retryOpts);
     }
   }
 }

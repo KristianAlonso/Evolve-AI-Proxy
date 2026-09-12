@@ -14,37 +14,27 @@ export interface Interpretation {
   resourcesNeeded: string[];
 }
 
-/** Ask the model to interpret a request in a strict JSON shape. */
+/**
+ * Ask the model to interpret a request in a strict JSON shape. ADR A-008: the caller builds the
+ * FULL prompt (`buildPhasePrompt(base, lastMessage, INTERPRET_INSTRUCTION)`) — no system message
+ * is added here, and the raw reply is returned (`raw`) so the caller can keep it as the process'
+ * last intermediate message.
+ */
 export async function interpretRequest(
   provider: ChatProvider,
   messages: UpstreamMessage[],
-  buildPrompt: (messages: UpstreamMessage[]) => string,
   options?: { model: string | null; logger?: TraceLogger; traceId?: string; abort_signal?: AbortSignal; passthrough?: Record<string, unknown> },
   emitter?: LiveEmitter,
-): Promise<{ interpretation: Interpretation; reasoning: string; streamed: boolean }> {
-  const instruction = [
-    'You are the interpreter of an agent loop proxy.',
-    'Analyze the user request and reply with ONLY a JSON object (no prose).',
-    'Object shape:',
-    '{"mainObjective":"one sentence","subObjectives":["..."],"resourcesNeeded":["path or info to gather"]}',
-    'If there are multiple aspects, subObjectives must have >= 1 item.',
-    'If you cannot identify any sub-objective, say why in mainObjective and leave subObjectives empty.',
-  ].join('\n');
-
-  const promptMessages: UpstreamMessage[] = [
-    { role: 'system', content: instruction },
-    ...messages,
-  ];
-
+): Promise<{ interpretation: Interpretation; reasoning: string; raw: string; streamed: boolean }> {
   // Single shared call (FASE 1): stream live reasoning deltas when an emitter is attached, and
   // buffer otherwise. Structured `content` here is internal JSON that gets parsed into a trace below,
   // so only the thinking path surfaces on the wire — emitting it as assistant text would corrupt the
   // client's answer reconstruction. When no emitter is present the call stays fully buffered, which is
-  // what every unit test exercises (they pass at most four args).
+  // what every unit test exercises (they pass at most three args).
   const { result, streamed } = await callWithStreaming({
     provider,
     model: options?.model ?? null, // concrete user-selected model — never "auto" (no-auto rule)
-    messages: promptMessages,
+    messages,
     // ADR A-007 (passthrough-intacto): no invented max_tokens budget — the client's request
     // parameters (temperature, max_tokens, ...) are forwarded exactly as sent; no client value means
     // no field in the upstream call.
@@ -54,11 +44,12 @@ export async function interpretRequest(
       if (reasoning !== '') emitter.emitReasoningDelta(0, reasoning);
     } : undefined,
   });
-  const text = (result.content ?? '').trim() || '{}';
+  const raw = (result.content ?? '').trim();
+  const text = raw || '{}';
   const parsed = safeJsonParse(text);
   if (!parsed) {
     // Fall back to treating the whole thing as the main objective.
-    return { interpretation: { mainObjective: text, subObjectives: [], resourcesNeeded: [] }, reasoning: result.reasoning, streamed };
+    return { interpretation: { mainObjective: text, subObjectives: [], resourcesNeeded: [] }, reasoning: result.reasoning, raw, streamed };
   }
 
   const mainObjective = String(parsed.mainObjective ?? text).slice(0, 500);
@@ -72,6 +63,7 @@ export async function interpretRequest(
   return {
     interpretation: { mainObjective, subObjectives, resourcesNeeded },
     reasoning: result.reasoning,
+    raw,
     streamed,
   };
 }

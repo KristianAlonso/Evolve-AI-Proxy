@@ -7,9 +7,8 @@
 //
 // Every field must be plain JSON (SessionStore serializes it for TTL bookkeeping).
 
-import type { AgentTask, LoopDecision, ToolChoice, ToolDefinition, UpstreamMessage } from '../types.js';
+import type { AgentTask, ContextStep, LoopDecision, ToolChoice, ToolDefinition, UpstreamMessage } from '../types.js';
 import type { Interpretation } from './interpreter.js';
-import type { ContextStep } from './context-manager.js';
 import type { SubagentSpawnSpec } from './subagent-spawn.js';
 
 export const ORCHESTRATOR_STAGES = ['planify', 'execute', 'evaluate', 'done'] as const;
@@ -41,6 +40,16 @@ export interface LoopStateData {
   task: AgentTask | null;
   /** Latest execute-phase output. */
   lastOutput: string;
+  /**
+   * ADR A-008: the ONLY intermediate message kept in the global process — the raw content of the
+   * LAST phase output. Every delegated phase prompt = internalMessages + (this, as one
+   * `assistant` turn) + instruction (user, appended at the end).
+   */
+  lastMessage: string;
+  /** ADR A-008 / R1: sticky — once the upstream rejects the structured conversation (4xx), every
+   *  later phase of this session uses the rendered (flat) base. */
+  fellBackToRendered: boolean;
+  /** Metadata only (final response / trace) — never carried into phase prompts (A-008). */
   accumulatedSteps: ContextStep[];
   /** agent_id -> last content of that subagent (the canonical phase result). */
   phaseResults: Record<string, string>;
@@ -73,6 +82,8 @@ export function newLoopState(args: {
     interpretation: null,
     task: null,
     lastOutput: '',
+    lastMessage: '',
+    fellBackToRendered: false,
     accumulatedSteps: [],
     phaseResults: {},
     pendingAgentId: null,

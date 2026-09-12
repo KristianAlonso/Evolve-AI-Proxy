@@ -21,21 +21,22 @@
 // Fail-safe: when the mapping finds no subagent-spawn tool (or the model cannot map it), `start`
 // returns null and the caller degrades to the classic inline AgentLoop — no request ever breaks.
 
+import { isAbortError } from '../provider/types.js';
 import type { ChatProvider } from '../provider/types.js';
 import type { TraceLogger } from '../logger.js';
-import type { LoopDecision, TaskResult, ToolCall, ToolChoice, ToolDefinition, UpstreamMessage } from '../types.js';
+import type { LoopDecision, ToolCall, ToolChoice, ToolDefinition, UpstreamMessage } from '../types.js';
 import { mapSubagentTool } from './subagent-mapper.js';
 import { interpretRequest } from './interpreter.js';
-import { buildEvaluatePrompt, classifyEvaluation } from './evaluator.js';
+import { classifyEvaluation } from './evaluator.js';
 import { callWithStreaming } from './stream-helper.js';
 import {
-  accumulatedSummary,
-  buildPlanifyPrompt,
-  buildRenderedExecutePrompt,
-  buildStructuredExecutePrompt,
+  buildEvaluateInstruction,
+  buildPhasePrompt,
+  buildPlanifyInstruction,
   goalHintForPlanify,
+  INTERPRET_INSTRUCTION,
   isStructuredRejection,
-  stepBullets,
+  toRenderedMessages,
 } from './phase-prompts.js';
 import { buildSpawnToolCall, newAgentId, type DelegatedPhase } from './subagent-spawn.js';
 import type { LoopStateData } from './loop-state.js';
@@ -98,13 +99,25 @@ export class SubagentOrchestrator {
     // client (R2); the structured JSON stays internal.
     const t0 = Date.now();
     const sink = args.makeSink?.();
-    const { interpretation } = await interpretRequest(
-      this.provider,
-      state.internalMessages,
-      () => '',
-      { model, logger: this.logger, traceId: args.traceId, abort_signal: args.abort_signal, passthrough: args.passthrough },
-      sink,
-    );
+    // ADR A-008: client base verbatim + last intermediate message + instruction (user, appended).
+    const interpretOpts = { model, logger: this.logger, traceId: args.traceId, abort_signal: args.abort_signal, passthrough: args.passthrough };
+    const interpretPrompt = (rendered: boolean) =>
+      buildPhasePrompt(rendered ? toRenderedMessages(state.internalMessages) : state.internalMessages, state.lastMessage || null, INTERPRET_INSTRUCTION);
+    let interp;
+    try {
+      interp = await interpretRequest(this.provider, interpretPrompt(state.fellBackToRendered), interpretOpts, sink);
+    } catch (err) {
+      if (!state.fellBackToRendered && isStructuredRejection(err) && !isAbortError(err) && !args.abort_signal?.aborted) {
+        state.fellBackToRendered = true;
+        this.logger.warn('orchestrator interpret: upstream rejected structured conversation — retrying rendered (sticky)');
+        interp = await interpretRequest(this.provider, interpretPrompt(true), interpretOpts, sink);
+      } else {
+        throw err;
+      }
+    }
+    const { interpretation } = interp;
+    // ADR A-008: the interpretation raw becomes the process' last intermediate message.
+    state.lastMessage = interp.raw || '';
     state.totalUpstreamCalls += 1;
     state.interpretation = interpretation;
     state.stage = 'planify';
@@ -173,11 +186,15 @@ export class SubagentOrchestrator {
               context_needed: [],
             };
             state.stage = 'execute';
+            // ADR A-008: the planify phase output becomes the process' last intermediate message.
+            state.lastMessage = (phaseResult ?? '').trim();
             break;
           }
           case 'execute': {
             const output = (phaseResult ?? '').trim() || '(no output)';
             state.lastOutput = output;
+            // ADR A-008: the execute output becomes the process' last intermediate message.
+            state.lastMessage = output;
             state.accumulatedSteps.push({
               iteration: state.round,
               objective: state.interpretation?.mainObjective,
@@ -189,6 +206,8 @@ export class SubagentOrchestrator {
             break;
           }
           case 'evaluate': {
+            // ADR A-008: the evaluate answer becomes the process' last intermediate message.
+            state.lastMessage = (phaseResult ?? '').trim();
             const decision = classifyEvaluation(phaseResult ?? '').decision;
             if (decision === 'complete') {
               state.decision = 'complete';
@@ -243,75 +262,44 @@ export class SubagentOrchestrator {
     const { agentId, phase } = binding;
     const t0 = Date.now();
 
-    let prompt: UpstreamMessage[];
+    // ADR A-008: delegated phases use the SAME single shape as the inline loop — client base
+    // verbatim + the last intermediate message (one `assistant` turn) + the instruction (user,
+    // appended at the end). No system message is ever added.
+    let instruction: string;
     switch (phase) {
       case 'planify':
-        prompt = buildPlanifyPrompt(goalHintForPlanify(state.originalInstruction, state.lastOutput));
+        instruction = buildPlanifyInstruction(goalHintForPlanify(state.originalInstruction, state.lastOutput));
         break;
-      case 'execute': {
-        const task = state.task?.description ?? state.originalInstruction;
-        prompt = buildStructuredExecutePrompt(state.originalInstruction, state.accumulatedSteps, task);
+      case 'execute':
+        instruction = state.task?.description ?? state.originalInstruction;
         break;
-      }
-      case 'evaluate': {
-        const taskResult: TaskResult = {
-          id: state.task?.id ?? `task-r${state.round}`,
-          status: 'completed',
-          output: state.lastOutput,
-          reasoning: '',
-          attempts: 1,
-        };
-        prompt = buildEvaluatePrompt(state.originalInstruction, accumulatedSummary(state.accumulatedSteps), taskResult);
+      case 'evaluate':
+        instruction = buildEvaluateInstruction(state.originalInstruction);
         break;
-      }
       default:
         throw new Error(`unknown delegated phase: ${phase}`);
     }
+    const phasePrompt = (rendered: boolean) =>
+      buildPhasePrompt(
+        rendered ? toRenderedMessages(state.internalMessages) : state.internalMessages,
+        state.lastMessage || null,
+        instruction,
+      );
 
-    let result;
-    if (phase === 'execute') {
-      // R1: structured assistant history first; if the upstream rejects the shape (4xx), retry ONCE
-      // with the rendered (flat) prompt.
-      const runWith = async (p: UpstreamMessage[]) => {
-        const out = await callWithStreaming({
-          provider: this.provider,
-          model,
-          messages: p,
-          options: {
-            tools: args.tools,
-            tool_choice: args.tool_choice,
-            logger: this.logger,
-            trace_id: args.traceId,
-            abort_signal: args.abort_signal,
-            passthrough: args.passthrough,
-          },
-          surfaceDelta: args.sink
-            ? (chunk) => {
-                const reasoning = typeof chunk.reasoning === 'string' ? chunk.reasoning : '';
-                const content = typeof chunk.content === 'string' ? chunk.content : '';
-                if (reasoning !== '') args.sink?.emitReasoningDelta(0, reasoning);
-                if (content !== '') args.sink?.emitContent(0, content);
-              }
-            : undefined,
-        });
-        return out.result;
-      };
-      try {
-        result = await runWith(prompt);
-      } catch (err) {
-        if (isStructuredRejection(err)) {
-          this.logger.warn(`subagent execute: upstream rejected structured assistant history — retrying rendered (agent_id=${agentId})`);
-          result = await runWith(buildRenderedExecutePrompt(state.originalInstruction, state.accumulatedSteps, state.task?.description ?? state.originalInstruction));
-        } else {
-          throw err;
-        }
-      }
-    } else {
+    const runWith = async (p: UpstreamMessage[]) => {
       const out = await callWithStreaming({
         provider: this.provider,
         model,
-        messages: prompt,
-        options: { logger: this.logger, trace_id: args.traceId, abort_signal: args.abort_signal, passthrough: args.passthrough },
+        messages: p,
+        options: {
+          // Only execute carries the client's tools (A-008: same rule as the inline loop).
+          tools: phase === 'execute' ? args.tools : undefined,
+          tool_choice: phase === 'execute' ? args.tool_choice : undefined,
+          logger: this.logger,
+          trace_id: args.traceId,
+          abort_signal: args.abort_signal,
+          passthrough: args.passthrough,
+        },
         surfaceDelta: args.sink
           ? (chunk) => {
               const reasoning = typeof chunk.reasoning === 'string' ? chunk.reasoning : '';
@@ -321,7 +309,20 @@ export class SubagentOrchestrator {
             }
           : undefined,
       });
-      result = out.result;
+      return out.result;
+    };
+
+    // Same sticky structured→rendered fallback as the inline loop (state.fellBackToRendered).
+    let result;
+    try {
+      result = await runWith(phasePrompt(state.fellBackToRendered));
+    } catch (err) {
+      if (state.fellBackToRendered || isAbortError(err) || args.abort_signal?.aborted || !isStructuredRejection(err)) {
+        throw err;
+      }
+      state.fellBackToRendered = true;
+      this.logger.warn(`subagent ${phase}: upstream rejected structured conversation — retrying rendered (sticky, agent_id=${agentId})`);
+      result = await runWith(phasePrompt(true));
     }
 
     state.phaseResults[agentId] = result.content ?? '';
@@ -371,7 +372,7 @@ export class SubagentOrchestrator {
       case 'planify':
         return [
           `Goal: "${state.originalInstruction}"`,
-          `Progress so far:\n${stepBullets(state.accumulatedSteps) || '(none)'}`,
+          `Latest result so far:\n${state.lastOutput || '(none)'}`,
           'Propose the next single concrete task that moves toward the goal.',
         ].join('\n\n');
       case 'execute':

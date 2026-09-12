@@ -88,6 +88,19 @@ export interface AgentTask {
   reasoning?: string;           // why this task was produced (for client tracing)
 }
 
+/**
+ * Metadata record of one loop step (ADR A-008): kept ONLY for the final response/trace
+ * (`tasks_executed`, `accumulated_context`) — never carried into upstream prompts; the phase
+ * prompts keep just the LAST intermediate message.
+ */
+export interface ContextStep {
+  iteration: number;
+  objective?: string;
+  task_id?: string;
+  output: string;   // what was produced this step
+  successful: boolean;
+}
+
 export type TaskStatus = 'pending' | 'executing' | 'completed' | 'failed';
 
 /** Outcome of running an AgentTask (retained even across retries, SC-014). */
