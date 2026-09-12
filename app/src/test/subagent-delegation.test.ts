@@ -9,6 +9,7 @@ import type { ToolCall, ToolDefinition, UpstreamMessage } from '../types.js';
 import {
   buildSpawnPrompt,
   buildSpawnToolCall,
+  detectTypeDrift,
   isSubagentContinuation,
   newAgentId,
   parseSpawnSpec,
@@ -159,6 +160,65 @@ describe('subagent spawn contract', () => {
     expect(
       parseSpawnSpec('{"tool_name":"task","arg_mapping":{"title":"a","type":"b","prompt":"c"},"subagent_types":[{"id":"x"}],"type_id":"y"}', ['task']),
     ).toBeNull();
+  });
+
+  describe('detectTypeDrift (deterministic, no model): type list changed between requests', () => {
+    const spec: SubagentSpawnSpec = {
+      toolName: 'task',
+      argMapping: { title: 'description', type: 'subagent_type', prompt: 'prompt' },
+      availableTypes: [
+        { id: 'plan', description: '' },
+        { id: 'build', description: '' },
+      ],
+      typeId: 'plan',
+    };
+    const toolsWithEnum = (ids: string[]): ToolDefinition[] => [
+      {
+        type: 'function',
+        function: {
+          name: 'task',
+          description: 'Launch a new agent.',
+          parameters: {
+            type: 'object',
+            properties: {
+              description: { type: 'string' },
+              subagent_type: { type: 'string', enum: ids },
+              prompt: { type: 'string' },
+            },
+          },
+        },
+      },
+    ];
+
+    it('detects drift when the type enum no longer contains ANY previously mapped type', () => {
+      expect(detectTypeDrift(spec, toolsWithEnum(['fresh', 'new']))).toBe(true);
+    });
+
+    it('no drift when the enum is unchanged or still contains a previously mapped type', () => {
+      expect(detectTypeDrift(spec, toolsWithEnum(['plan', 'build']))).toBe(false);
+      expect(detectTypeDrift(spec, toolsWithEnum(['build', 'plan', 'extra']))).toBe(false);
+      expect(detectTypeDrift(spec, toolsWithEnum(['extra', 'plan']))).toBe(false);
+    });
+
+    it('detects drift when the spawn tool disappears from the client tools', () => {
+      expect(detectTypeDrift(spec, [])).toBe(true);
+      expect(detectTypeDrift(spec, [OTHER_TOOL])).toBe(true);
+    });
+
+    it('cannot detect (returns false) when the type argument is free-form (no enum to read)', () => {
+      const freeForm: ToolDefinition = {
+        type: 'function',
+        function: {
+          name: 'task',
+          description: 'Launch a new agent.',
+          parameters: {
+            type: 'object',
+            properties: { description: { type: 'string' }, subagent_type: { type: 'string' }, prompt: { type: 'string' } },
+          },
+        },
+      };
+      expect(detectTypeDrift(spec, [freeForm])).toBe(false);
+    });
   });
 
   it('newAgentId is unique-ish and prefixed', () => {
@@ -414,6 +474,45 @@ describe('subagent orchestrator', () => {
     const stuck = orchestrator.resume(state, 'ses_parent_1');
     expect(state.activeTypeId).toBe('critic');
     expect(stuck.toolCall!.id).toBe(`spawn_${idAtLast}`);
+  });
+
+  it('resume(): after a drift re-mapping (new spec + activeTypeId), spawns use the new type', () => {
+    const orchestrator = new SubagentOrchestrator(stub(), log);
+    const state = makeState();
+    state.pendingAgentId = 'agent-a';
+    expect(state.activeTypeId).toBe('plan');
+
+    // Simulates the routes drift handler: the client's type list changed and the mapping was
+    // re-run with a new tool schema (fresh type ids).
+    const freshTools: ToolDefinition[] = [
+      {
+        type: 'function',
+        function: {
+          name: 'task',
+          description: 'Launch a new agent.',
+          parameters: {
+            type: 'object',
+            properties: { description: { type: 'string' }, subagent_type: { type: 'string', enum: ['fresh', 'new'] }, prompt: { type: 'string' } },
+          },
+        },
+      },
+    ];
+    expect(detectTypeDrift(state.spec!, freshTools)).toBe(true);
+    state.spec = {
+      toolName: 'task',
+      argMapping: { title: 'description', type: 'subagent_type', prompt: 'prompt' },
+      availableTypes: [{ id: 'fresh', description: '' }, { id: 'new', description: '' }],
+      typeId: 'fresh',
+    };
+    state.activeTypeId = 'fresh';
+    state.spawnRetries = 0;
+
+    // The next spawn travels with the new type.
+    state.phaseResults['agent-a'] = JSON.stringify({ description: 'A real step' });
+    const out = orchestrator.resume(state, 'ses_parent_1');
+    expect(out.kind).toBe('tool_call');
+    expect(JSON.parse(out.toolCall!.function.arguments).subagent_type).toBe('fresh');
+    expect(state.stage).toBe('execute');
   });
 
   it('resume(): a real phase result resets the retry counter and pins the current type', () => {

@@ -30,7 +30,8 @@ import type { ProxyRequest, ToolCall, ToolChoice, ToolDefinition, UpstreamMessag
 import type { LoopDecision } from './types.js';
 import { SubagentOrchestrator, type OrchestratorOutcome, type SubagentBinding } from './core/orchestrator.js';
 import { newLoopState, type LoopStateData } from './core/loop-state.js';
-import { isSubagentContinuation, parseSubagentEnvelope } from './core/subagent-spawn.js';
+import { detectTypeDrift, isSubagentContinuation, parseSubagentEnvelope } from './core/subagent-spawn.js';
+import { mapSubagentTool } from './core/subagent-mapper.js';
 import { accumulatedSummary, toInternalMessages } from './core/phase-prompts.js';
 import env from './config.js';
 
@@ -398,6 +399,33 @@ export async function createApp(options: CreateAppOptions = {}): Promise<Fastify
     } else if (session?.loopState && sessionId) {
       // PARENT RESUME: no upstream call happens here — the phase already ran in the subagent's
       // request; we only consume the stored result and emit the next spawn (or the final answer).
+      //
+      // TYPE DRIFT: the client can change the list of subagent types it offers between requests
+      // (or rename the spawn tool). This branch is the parent's own conversation (subagent
+      // phase requests take the envelope branch above), so it is the only place to refresh the
+      // mapping. The drift check itself is deterministic (it reads the type argument's `enum`
+      // from the incoming tools schema — no model involved); only when drift is confirmed do we
+      // re-run the mapping to get a new spec. If the remap fails, the previous spec is kept.
+      if (session.loopState.spec && body.tools && body.tools.length > 0 && detectTypeDrift(session.loopState.spec, body.tools)) {
+        const previousType = session.loopState.activeTypeId;
+        const remapped = await mapSubagentTool(provider, body.tools, {
+          model: session.model,
+          logger: log,
+          traceId,
+          abort_signal: abortController.signal,
+        });
+        if (remapped) {
+          log.warn(
+            `orchestrator resume: subagent type list drifted (previous type="${previousType}" no longer exists) — remapped ` +
+              `type="${remapped.typeId}" available=[${remapped.availableTypes.map((t) => t.id).join(',')}]`,
+          );
+          session.loopState.spec = remapped;
+          session.loopState.activeTypeId = remapped.typeId; // the old type cannot be used anymore
+          session.loopState.spawnRetries = 0;
+        } else {
+          log.warn(`orchestrator resume: type drift detected but remap failed — keeping previous spec (type="${previousType}")`);
+        }
+      }
       const orchestrator = new SubagentOrchestrator(provider, log);
       const outcome = orchestrator.resume(session.loopState, sessionId);
       const finalResult = toFinalResult(session.loopState, outcome);
@@ -440,10 +468,14 @@ export async function createApp(options: CreateAppOptions = {}): Promise<Fastify
         state,
         sessionId,
         model: concreteModel,
-        makeSink: () => {
-          writerRef = new SseWriter(reply as unknown as FastifyReply, log);
-          return new SinkAdapter(writerRef!);
-        },
+        // Only for streaming requests: creating the SseWriter has side effects (it writes the
+        // `: connected` comment to the raw socket), which would corrupt a non-stream JSON reply.
+        makeSink: body.stream
+          ? () => {
+              writerRef = new SseWriter(reply as unknown as FastifyReply, log);
+              return new SinkAdapter(writerRef!);
+            }
+          : undefined,
         traceId,
         abort_signal: abortController.signal,
       });

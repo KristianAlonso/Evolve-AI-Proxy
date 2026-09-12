@@ -35,6 +35,32 @@ El resultado de una fase es el **último** `content` del subagente (no el primer
 
 `src/core/phase-prompts.ts` es la única fuente de los prompts de cada fase (planify/execute/evaluate) y de la shaping de mensajes (R1: los mensajes `assistant` viajan con su rol real; fallback *rendered* ante rechazo 4xx del upstream, sticky para el resto de la ejecución). El bucle inline (`agent-loop.ts`) y el orquestador usan los mismos builders, por lo que los routers de los stubs de test y el comportamiento live coinciden en las mismas marcas de texto.
 
+### Mecanismo de failover y re-emisión (endurecimiento)
+
+En `resume()`, el resultado de la fase pendiente es el de la sesión (`phaseResults`):
+
+- **Resultado disponible** → se consume (last content wins), se avanza la máquina de estados, y si el
+  spawn en curso es el mismo agente se resetea el contador de re-emisiones (el tipo queda fijado).
+- **Sin resultado** (el cliente bloqueó o no ejecutó el subagente) → el proxy **re-emite el mismo
+  spawn** (mismo `agent_id`) sin consumir el estado; el contador `spawnRetries` crece. Tras
+  `SPAWN_RETRY_THRESHOLD` (3) re-emisiones sin resultado, si quedan tipos disponibles, se rota al
+  siguiente y se re-dispara con un `agent_id` nuevo. Sin candidatos más, se queda re-emitiendo de
+  forma estable.
+
+### Detección de drift de la lista de tipos (re-mapeo entre peticiones)
+
+El cliente puede cambiar la lista de tipos de subagente que ofrece entre peticiones (o renombrar
+la herramienta de spawn). `detectTypeDrift()` (en `subagent-spawn.ts`) lo detecta de forma
+**determinista, sin intervenir el modelo**: la única fuente maquina-legible de la lista es el
+`enum` del argumento `type` de la herramienta en el esquema entrante. Se evalúa en la rama de
+**parent-resume** (nunca durante una fase subagente: esas peticiones entran por la rama de
+envelope). Drift confirmado = la herramienta de spawn desapareció de `tools`, o el argumento
+`type` tiene un `enum` real y ninguno de los ids de `spec.availableTypes` aparece en él. Si el
+argumento es free-form (sin `enum`), el drift **no es detectable sin el modelo** y no se
+re-mapea (restricción explícita: no preguntarle al modelo para detectarlo). Al confirmar drift,
+la ruta re-ejecuta `mapSubagentTool` (la única llamada upstream del mecanismo); si el re-mapeo
+falla, se conserva la especificación anterior y se aplica el failover/re-emisión sobre ella.
+
 ### Alternativas Consideradas
 
 | Alternativa | Ventajas | Desventajas | Por qué no se eligió |
@@ -69,6 +95,7 @@ El resultado de una fase es el **último** `content` del subagente (no el primer
 | El modelo inventa un tipo de subagente que el cliente no reconoce | Doble validación: `type_id` debe existir en la lista que el propio modelo enumeró (`parseSpawnSpec`), y todos los ids deben estar en el `enum` real del argumento type cuando el schema lo lleva (mapper). Con string libre, el prompt prefiere el tipo más genérico. |
 | El modelo local puede ser incapaz de mapear la herramienta (presupuesto de salida en thinking) | `max_tokens: 8192` + prompt compacto (verificado live: mapeo exitoso en el primer intento con `llama_cpp/default`); si aún falla → inline |
 | Cuerpos de conversación que crecen entre peticiones pueden exceder límites de tamaño del upstream (se observó `Payload Too Large` en un run live) | Fuera de alcance del contrato de delegación; el contexto de las fases ya está limitado por diseño (`max_rounds`, bullets truncados) |
+| La lista de tipos de subagente que ofrece el cliente cambia entre peticiones | Detección determinista de drift (`detectTypeDrift`) + re-mapeo automático en la rama de parent-resume. Limitación aceptada: con argumento `type` free-form (sin `enum`) el drift no es detectable sin el modelo y no se re-mapea |
 | Complejidad de `routes.ts` (3 ramas + helpers) | Helpers separados (`handleSubagentPhase`, `recordSubagentResult`, `toFinalResult`) y tests unitarios del orquestador/mapeo/spawn |
 
 ## Evidencia de verificación live
@@ -79,6 +106,7 @@ Con `opencode` (218 tools, `opencode-swarm`) contra `llama_cpp/default`:
 2. `start()` emite `spawn` de `planify (round 1)`; cada petición de parent-resume emite el siguiente spawn (`execute`, `evaluate`, `planify (round 2)`…), cada una en ~10 ms y 3 SSE frames.
 3. Los subagentes se mostraron en el cliente con título y tipo (`planify (round 5) — Explorer Agent`), confirmando R2/R3 en el wire OpenAI estándar.
 4. Con el plugin bloqueando los dispatches (contrato `ACCEPTANCE`), se activó el endurecimiento: re-emisión estable del mismo spawn sin avanzar rondas.
+5. **Drift de tipos (verificación determinista vía HTTP):** inicio con `enum=[plan,build]` → mapeo `type="build"`, spawn `type=build`. Parent-resume con el mismo `enum` → **sin** re-mapeo (0.0 s, sin upstream call), re-emisión `type=build`. Parent-resume con `enum=[fresh,new]` → `WARN subagent type list drifted (previous type="build" no longer exists) — remapped type="new"` → spawn re-emitido con `type=new`.
 
 ## Referencias
 

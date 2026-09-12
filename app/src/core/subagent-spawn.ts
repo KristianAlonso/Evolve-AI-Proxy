@@ -11,7 +11,7 @@
 // it is never passed as a tool argument (the envelope in the prompt is the single source of truth
 // to re-link the subagent's incoming request to its phase).
 
-import type { ToolCall, UpstreamMessage } from '../types.js';
+import type { ToolCall, ToolDefinition, UpstreamMessage } from '../types.js';
 
 /** The three phases that run inside delegated subagents (everything except `interpret`, which
  *  runs in the parent request). */
@@ -191,10 +191,36 @@ export function parseSpawnSpec(
   const typeId = typeof parsed.type_id === 'string' ? (parsed.type_id as string).trim() : '';
   if (!availableTypes.some((t) => t.id === typeId)) return null;
 
+
   return {
     toolName,
     argMapping: { title: mapping.title, type: mapping.type, prompt: mapping.prompt },
     availableTypes,
     typeId,
   };
+}
+
+/**
+ * Deterministic (no model involved) detection of a subagent-type list drift between requests.
+ * The client may change the list of subagent types it offers between requests (or even rename the
+ * spawn tool itself): the only machine-readable source of that list is the `enum` of the spawn
+ * tool's type argument in the incoming `tools` schema, so the check needs no upstream call.
+ *
+ * Returns TRUE (drift: none of the previously mapped types exists in the current request — the
+ * caller should re-run the mapping) when:
+ *   - the spawn tool is no longer offered at all, OR
+ *   - the type argument carries a real `enum` and NONE of `spec.availableTypes` ids appears in it.
+ *
+ * Returns FALSE when the check is inconclusive (the type argument is a free-form string: no enum
+ * to read, so the previous types may or may not still exist) or when at least one previously
+ * mapped type still exists in the current enum.
+ */
+export function detectTypeDrift(spec: SubagentSpawnSpec, currentTools: ToolDefinition[]): boolean {
+  const tool = currentTools.find((t) => t.function.name === spec.toolName);
+  if (!tool) return true; // the spawn tool disappeared — the type list has certainly changed
+  const params = tool.function.parameters as { properties?: Record<string, { enum?: string[] }> } | undefined;
+  const enumVals = params?.properties?.[spec.argMapping.type]?.enum;
+  if (!Array.isArray(enumVals) || enumVals.length === 0) return false; // free-form: cannot detect without the model
+  const current = enumVals.map((v) => String(v));
+  return !spec.availableTypes.some((t) => current.includes(t.id));
 }
