@@ -43,7 +43,8 @@ En `resume()`, el resultado de la fase pendiente es el de la sesión (`phaseResu
   spawn en curso es el mismo agente se resetea el contador de re-emisiones (el tipo queda fijado).
 - **Sin resultado** (el cliente bloqueó o no ejecutó el subagente) → el proxy **re-emite el mismo
   spawn** (mismo `agent_id`) sin consumir el estado; el contador `spawnRetries` crece. Tras
-  `SPAWN_RETRY_THRESHOLD` (3) re-emisiones sin resultado, si quedan tipos disponibles, se rota al
+  `SPAWN_RETRY_THRESHOLD` re-emisiones sin resultado (configurable vía la variable de entorno
+  `SPAWN_RETRY_THRESHOLD`, por defecto 3), si quedan tipos disponibles, se rota al
   siguiente y se re-dispara con un `agent_id` nuevo. Sin candidatos más, se queda re-emitiendo de
   forma estable.
 

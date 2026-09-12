@@ -20,6 +20,9 @@ export interface Env {
   CAPTURE_DIR: string;
   /** Whether to capture incoming requests to disk at all. */
   CAPTURE_REQUESTS: boolean;
+  /** FASE 6: spawn re-emissions of the same pending phase (without a result) tolerated before
+   *  the orchestrator fails over to the next subagent type. Default: 3. */
+  SPAWN_RETRY_THRESHOLD: number;
 }
 
 const env: Env = {
@@ -33,6 +36,10 @@ const env: Env = {
   CONSOLE_LOG: (process.env.CONSOLE_LOG ?? 'true') === 'true',
   CAPTURE_DIR: process.env.CAPTURE_DIR ?? './captures',
   CAPTURE_REQUESTS: (process.env.CAPTURE_REQUESTS ?? 'true') === 'true',
+  SPAWN_RETRY_THRESHOLD: (() => {
+    const n = Number(process.env.SPAWN_RETRY_THRESHOLD);
+    return Number.isFinite(n) && n >= 1 ? Math.floor(n) : 3;
+  })(),
 };
 
 export default env;

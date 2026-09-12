@@ -23,6 +23,7 @@
 
 import type { ChatProvider } from '../provider/types.js';
 import type { TraceLogger } from '../logger.js';
+import env from '../config.js';
 import type { LoopDecision, TaskResult, ToolCall, ToolChoice, ToolDefinition, UpstreamMessage } from '../types.js';
 import { mapSubagentTool } from './subagent-mapper.js';
 import { interpretRequest } from './interpreter.js';
@@ -45,9 +46,9 @@ import type { LoopSink } from './agent-loop.js';
  * How many consecutive spawn re-emissions of the SAME pending phase (without any phase result
  * arriving) are tolerated before the orchestrator rotates to the next available subagent type
  * from `spec.availableTypes` (failover). The type that finally yields a phase result is pinned
- * for the rest of the session.
+ * for the rest of the session. Configurable via the `SPAWN_RETRY_THRESHOLD` env var (default 3).
  */
-export const SPAWN_RETRY_THRESHOLD = 3;
+export const SPAWN_RETRY_THRESHOLD: number = env.SPAWN_RETRY_THRESHOLD;
 
 /** One delegated subagent: its agent_id + the phase it is running. */
 export interface SubagentBinding {
