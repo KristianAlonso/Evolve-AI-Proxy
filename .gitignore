@@ -91,3 +91,6 @@ typings/
 .claude/
 app/tmp-wire/
 tmp-oc/
+
+# Request/upstream capture dumps
+app/captures/
