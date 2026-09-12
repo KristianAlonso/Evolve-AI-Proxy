@@ -15,6 +15,15 @@ import { callWithStreaming } from './stream-helper.js';
 import { withAutoHealingRetry } from '../safety/auto-healing-retry.js';
 import { ContextManager, type ContextStep } from './context-manager.js';
 import { detectDoomLoop, type DoomLoopResult } from '../safety/doom-loop-detector.js';
+import {
+  buildPlanifyPrompt,
+  buildRenderedExecutePrompt,
+  buildStructuredExecutePrompt,
+  goalHintForPlanify,
+  isStructuredRejection,
+  toInternalMessages,
+  toRenderedMessages,
+} from './phase-prompts.js';
 
 /** Minimal sink the orchestrator writes to. Structurally satisfied by SseWriter AND a test sink. */
 export interface LoopSink {
@@ -89,6 +98,9 @@ export class AgentLoop {
   private provider: ChatProvider;
   private sink?: LoopSink;
   private logger: TraceLogger;
+  /** R1 (FASE 6): sticky after a 4xx rejection of the structured assistant history — every later
+   *  phase of this run uses the rendered (flat) conversation/prompt shape. */
+  private fellBackToRendered = false;
   private ctxManager = new ContextManager(4096);
   private phaseSet = new Set<Phase>();
   /** Live upstream-call counter (SC-018). */
@@ -123,13 +135,12 @@ export class AgentLoop {
       `tool_choice=${o.tool_choice ?? '-'} resume=${buildToolTranscript(messages).length > 0}`,
     );
 
-    // FASE 2: the internal loop phases (interpret/planify/evaluate) never see the structured
-    // tool-exchange turns that travel on the wire (assistant tool_calls + tool results) — those
-    // are wire-protocol artifacts, and re-sending them as provider tool messages can trip
-    // provider-specific requirements (e.g. Gemini thought_signatures) on resume. They are rendered
-    // as plain text for the internal phases; the structured transcript is injected into the
-    // execute prompt instead (see buildExecuteContent / buildToolTranscript).
-    const internalMessages = toInternalMessages(messages);
+    // R1 (FASE 6): assistant turns (including the client's tool_call/tool-result exchange) travel
+    // to the model as REAL assistant/tool turns — the model's own history is its own history. For
+    // upstreams that reject that shape (4xx, e.g. Vertex thought_signatures) we retry ONCE with
+    // the rendered (flat) version and stay on it for the rest of the run (fellBackToRendered).
+    const structuredInternal = toInternalMessages(messages);
+    const renderedInternal = toRenderedMessages(messages);
 
     for (; round < o.max_rounds; round++) {
       try {
@@ -153,7 +164,18 @@ export class AgentLoop {
         // fallback emit below would duplicate what already left on the wire — skip it then.
         const interpT0 = Date.now();
         this.countCall('interpret');
-        const interp = await interpretRequest(this.provider, [...internalMessages], () => '', { model: o.model, logger: this.logger, traceId: o.traceId, abort_signal: o.abort_signal }, this.sink);
+        let interp;
+        try {
+          interp = await interpretRequest(this.provider, this.fellBackToRendered ? [...renderedInternal] : [...structuredInternal], () => '', { model: o.model, logger: this.logger, traceId: o.traceId, abort_signal: o.abort_signal }, this.sink);
+        } catch (err) {
+          if (!this.fellBackToRendered && isStructuredRejection(err) && !isAbortError(err) && !o.abort_signal?.aborted) {
+            this.fellBackToRendered = true;
+            this.logger.warn('interpret: upstream rejected structured conversation — retrying with rendered (flat) conversation');
+            interp = await interpretRequest(this.provider, [...renderedInternal], () => '', { model: o.model, logger: this.logger, traceId: o.traceId, abort_signal: o.abort_signal }, this.sink);
+          } else {
+            throw err;
+          }
+        }
         if (this.sink && !interp.streamed) this.sink.emitReasoning(0, interp.reasoning || interp.interpretation.mainObjective);
         this.logger.info(
           `interpret (round ${round + 1}): ${Date.now() - interpT0}ms objective="${interp.interpretation.mainObjective.replace(/\s+/g, ' ').slice(0, 160)}" ` +
@@ -166,18 +188,18 @@ export class AgentLoop {
         // ---- Planning / task selection. Consume pre-generated tasks in order, refine when out. ----
         this.emitPhase('planning', { step: 'planify' });
         const planT0 = Date.now();
-        const task = tasks[round] ?? await this.planify(nextGoalHint(originalInstruction, lastOutput));
+        const task = tasks[round] ?? await this.planify(goalHintForPlanify(originalInstruction, lastOutput));
         this.logger.info(`plan (round ${round + 1}): ${Date.now() - planT0}ms task="${task.description.replace(/\s+/g, ' ').slice(0, 160)}"`);
         trace.push({ iteration: round + 1, phase: 'planning', task_id: task.id, content: task.description });
 
         // ---- Execute with auto-healing + doom-loop guard (SC-012/013/014). ----
         this.emitPhase('executing_task', { step: `execute #${round + 1}` });
-        const executeStep: ExecStep = async () => {
-          const prompt = [
-            ...this.buildContextPrompt(originalInstruction, accumulatedSteps),
-            { role: 'user' as const, content: this.buildExecuteContent(task, messages) },
-          ];
-
+        // R1 (FASE 6): previous step outputs ride as real assistant turns (structured prompt);
+        // the rendered (flat) shape is the 4xx fallback. Both share the same task content.
+        const taskContent = this.buildExecuteContent(task, messages);
+        const structuredPrompt = buildStructuredExecutePrompt(originalInstruction, accumulatedSteps, taskContent);
+        const renderedPrompt = buildRenderedExecutePrompt(originalInstruction, accumulatedSteps, taskContent);
+        const makeExecuteStep = (prompt: UpstreamMessage[]): ExecStep => async () => {
           // The provider call options carry the delegated client tools (FASE 2); interpretation /
           // planning / evaluation never receive them.
           const callOptions = { tools: o.tools, tool_choice: o.tool_choice, logger: this.logger, trace_id: o.traceId, abort_signal: o.abort_signal };
@@ -229,11 +251,7 @@ export class AgentLoop {
         let outcome;
         const execT0 = Date.now();
         try {
-          outcome = await withAutoHealingRetry(executeStep, {
-            maxRetries: o.max_retries,
-            doomLoopThreshold: o.doom_loop_threshold,
-            abortSignal: o.abort_signal,
-          });
+          outcome = await this.runExecuteWithFallback(makeExecuteStep, structuredPrompt, renderedPrompt, round, o);
         } catch (err) {
           if (isAbortError(err) || o.abort_signal?.aborted) {
             this.logger.warn(`execute aborted (round ${round + 1}): ${Date.now() - execT0}ms — stopped per client request`);
@@ -337,7 +355,7 @@ export class AgentLoop {
         // ---- Replenish the task queue from a fresh interpretation when we run out. ----
         if (round + 1 >= tasks.length) {
           const refined = await generateTasks(this.provider, originalInstruction, interp.interpretation);
-          tasks = refined.length > 1 ? refined : [await this.planify(nextGoalHint(originalInstruction, lastOutput))];
+          tasks = refined.length > 1 ? refined : [await this.planify(goalHintForPlanify(originalInstruction, lastOutput))];
         }
       } catch (err) {
         // Any upstream failure during interpretation, planning, execution or evaluation SC-014.
@@ -407,14 +425,6 @@ export class AgentLoop {
     this.phaseSet.add(phase);
   }
 
-  private buildContextPrompt(original: string, steps: ContextStep[]): UpstreamMessage[] {
-    const history = steps.map((s) => `- iter ${s.iteration}: ${s.output.slice(0, 160)}`).join('\n');
-    return [
-      { role: 'system', content: `Goal: ${original}` },
-      { role: 'user', content: `Progress so far:\n${history || '(none)'}` },
-    ];
-  }
-
   /**
    * Build the execute user turn (FASE 2): the task, plus — when client tools are in play — the
    * instructions that tools exist, and the transcript of the tool exchange already performed by
@@ -446,10 +456,7 @@ export class AgentLoop {
   }
 
   private async planify(goalHint: string): Promise<AgentTask> {
-    const prompt: UpstreamMessage[] = [
-      { role: 'system', content: 'You are planning the next concrete, single action to move toward the goal.' },
-      { role: 'user', content: `Goal hint:\n${goalHint}\n\nReply EXACTLY with one AgentTask JSON: {"description":"<one clear sentence>"}` },
-    ];
+    const prompt = buildPlanifyPrompt(goalHint);
     this.countCall('planify');
     // FASE 1: planning reasoning also streams live to a watching client. The task-description JSON
     // is internal — only the thinking path is surfaced (same rule as interpretation/evaluation).
@@ -467,48 +474,32 @@ export class AgentLoop {
     });
     return { id: `task-refine-${Date.now()}`, description: (result.content ?? '').trim(), context_needed: [] };
   }
-}
 
-/** A tiny hint used to ask the model for its next best sub-goal. */
-function nextGoalHint(original: string, lastOutput: string): string {
-  return `The goal is: "${original}". Previous attempt produced roughly: ${(lastOutput || '').slice(0, 240)}`;
-}
-
-/**
- * Sanitize the incoming wire conversation for the internal loop phases (FASE 2): assistant
- * tool_call turns and tool-result turns are collected and rendered as a single plain-text USER
- * turn. Reasons:
- *   1. The interpret/planify/evaluate prompts never carry structured tool parts (providers with
- *      opaque per-provider requirements like Gemini thought_signatures must not see them).
- *   2. The rendered turn is `role: user` — Vertex-backed models reject requests whose final
- *      message is an assistant/model turn.
- */
-function toInternalMessages(messages: UpstreamMessage[]): UpstreamMessage[] {
-  const out: UpstreamMessage[] = [];
-  let exchange: string[] = [];
-  const flushExchange = (out: UpstreamMessage[]): void => {
-    if (exchange.length > 0) {
-      out.push({ role: 'user', content: `Tool exchange (already performed by the client):\n${exchange.join('\n')}` });
-      exchange = [];
-    }
-  };
-  for (const message of messages) {
-    if (message.role === 'tool') {
-      exchange.push(`tool result for ${message.tool_call_id ?? ''}: ${message.content ?? ''}`);
-      continue;
-    }
-    if (message.role === 'assistant' && message.tool_calls && message.tool_calls.length > 0) {
-      for (const call of message.tool_calls) {
-        exchange.push(`assistant tool_call ${call.id}: ${call.function.name}(${call.function.arguments})`);
+  /**
+   * R1 (FASE 6): run the execute step against the STRUCTURED prompt (previous outputs as real
+   * assistant turns); if the upstream rejects that conversation shape (4xx), retry ONCE with the
+   * rendered (flat) prompt and stay on it (sticky). Aborts and non-structured errors propagate
+   * untouched (the outer loop handles them).
+   */
+  private async runExecuteWithFallback(
+    makeExecuteStep: (prompt: UpstreamMessage[]) => ExecStep,
+    structured: UpstreamMessage[],
+    rendered: UpstreamMessage[],
+    round: number,
+    o: ReturnType<AgentLoop['resolvedOptions']>,
+  ) {
+    const retryOpts = { maxRetries: o.max_retries, doomLoopThreshold: o.doom_loop_threshold, abortSignal: o.abort_signal };
+    try {
+      return await withAutoHealingRetry(makeExecuteStep(structured), retryOpts);
+    } catch (err) {
+      if (this.fellBackToRendered || isAbortError(err) || o.abort_signal?.aborted || !isStructuredRejection(err)) {
+        throw err;
       }
-      if (message.content) exchange.push(`assistant: ${message.content}`);
-      continue;
+      this.fellBackToRendered = true;
+      this.logger.warn(`execute (round ${round + 1}): upstream rejected structured assistant history — retrying with rendered (flat) prompt`);
+      return await withAutoHealingRetry(makeExecuteStep(rendered), retryOpts);
     }
-    flushExchange(out);
-    out.push(message);
   }
-  flushExchange(out);
-  return out;
 }
 
 /**

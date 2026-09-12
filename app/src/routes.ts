@@ -26,8 +26,12 @@ import type { ChatProvider, UpstreamModel } from './provider/types.js';
 import type { LoopSink } from './core/agent-loop.js';
 import { SessionStore } from './core/session-store.js';
 import { SseWriter } from './sse-writer.js';
-import type { ProxyRequest, ToolCall, UpstreamMessage } from './types.js';
+import type { ProxyRequest, ToolCall, ToolChoice, ToolDefinition, UpstreamMessage } from './types.js';
 import type { LoopDecision } from './types.js';
+import { SubagentOrchestrator, type OrchestratorOutcome, type SubagentBinding } from './core/orchestrator.js';
+import { newLoopState, type LoopStateData } from './core/loop-state.js';
+import { isSubagentContinuation, parseSubagentEnvelope } from './core/subagent-spawn.js';
+import { accumulatedSummary, toInternalMessages } from './core/phase-prompts.js';
 import env from './config.js';
 
 /**
@@ -92,10 +96,17 @@ function toOpenAICompletion(model: string, finalResult: FinalResultData, traceId
  * lines sane); otherwise the proxy mints one. Every log line of the request carries it, and it is
  * echoed back in the `x-trace-id` response header (and in `meta.trace_id` on the JSON path).
  */
-function readTraceId(headers: Record<string, unknown>): string {
-  const incoming = headers['x-trace-id'];
-  if (typeof incoming === 'string' && incoming.length > 0 && incoming.length <= 128) return incoming;
-  return newTraceId();
+function readTraceId(request: FastifyRequest): string {
+  // Reuse the id the onRequest hook already minted for this request, so the id is stable across
+  // every hook/handler/error of the same request (previously each call minted a new one when the
+  // client did not send `x-trace-id`, fragmenting the log family).
+  const meta = (request as FastifyRequest & { requestMeta?: { traceId?: string } }).requestMeta;
+  if (meta?.traceId) return meta.traceId;
+  const incoming = request.headers['x-trace-id'];
+  const traceId = typeof incoming === 'string' && incoming.length > 0 && incoming.length <= 128 ? incoming : newTraceId();
+  if (meta) meta.traceId = traceId;
+  else (request as FastifyRequest & { requestMeta?: { start?: number; traceId?: string } }).requestMeta = { traceId };
+  return traceId;
 }
 
 /**
@@ -170,7 +181,7 @@ export async function createApp(options: CreateAppOptions = {}): Promise<Fastify
   // ---- and trace id the moment it arrives, before any processing. The same `x-trace-id` header
   // ---- policy as the chat route: honoured from the client if sane, minted otherwise.
   app.addHook('onRequest', async (request: FastifyRequest, reply: FastifyReply) => {
-    const traceId = readTraceId(request.headers);
+    const traceId = readTraceId(request);
     reply.header('x-trace-id', traceId);
     // Per-request scratch for the onResponse summary (elapsed + stream type).
     (request as FastifyRequest & { requestMeta?: { start: number; stream: boolean | undefined; traceId?: string } }).requestMeta = {
@@ -203,7 +214,7 @@ export async function createApp(options: CreateAppOptions = {}): Promise<Fastify
   // ---- inspect it), validation 400s, and unexpected 500s — is logged with its trace id and
   // ---- answered with Fastify's standard error body. No error is ever a silent 4xx/5xx. ----
   app.setErrorHandler((error: FastifyError, request: FastifyRequest, reply: FastifyReply) => {
-    const traceId = readTraceId(request.headers);
+    const traceId = readTraceId(request);
     const status = error.statusCode && error.statusCode >= 400 && error.statusCode < 500 ? error.statusCode : 500;
     logger.traced(traceId).error(
       `error ${status} on ${request.method} ${request.url}: ${error.message}`,
@@ -228,7 +239,7 @@ export async function createApp(options: CreateAppOptions = {}): Promise<Fastify
   // ---- SC-024: validate ALL request fields at once, before any loop logic runs. ----
   app.addHook('preValidation', async (request: FastifyRequest, reply: FastifyReply) => {
     if (!request.url.startsWith('/v1/chat/completions')) return;
-    const traceId = readTraceId(request.headers);
+    const traceId = readTraceId(request);
     reply.header('x-trace-id', traceId);
     const result: ValidationResult = validateRequest(request.body);
     if (result.ok) return;
@@ -240,7 +251,7 @@ export async function createApp(options: CreateAppOptions = {}): Promise<Fastify
   app.post('/v1/chat/completions', async (request, reply) => {
     // Tracing (SC-025): one trace id per request, threaded through every layer (routes -> loop ->
     // provider -> SSE writer) and echoed back so clients can correlate logs with their requests.
-    const traceId = readTraceId(request.headers);
+    const traceId = readTraceId(request);
     const log: TraceLogger = logger.traced(traceId);
     reply.header('x-trace-id', traceId);
     const requestStart = Date.now();
@@ -330,6 +341,145 @@ export async function createApp(options: CreateAppOptions = {}): Promise<Fastify
     const rawSessionId = request.headers['x-session-id'];
     const sessionId = typeof rawSessionId === 'string' && rawSessionId.length > 0 ? rawSessionId : undefined;
     const store = options.sessionStore ?? defaultSessionStore;
+    const session = sessionId ? store.get(sessionId) : undefined;
+
+    // ---- FASE 6: tripartition for subagent phase delegation (R3) --------------------------------
+    // A request with client tools plays exactly one role:
+    //   1. SUBAGENT — its prompt carries a spawn envelope (or it is a bound subagent session).
+    //      First request of a phase: the proxy runs that ONE phase from the parent's stored loop
+    //      state. Later requests (the subagent iterating internally) are served normally, and
+    //      their final content updates the parent's phase result (last content wins).
+    //   2. PARENT RESUME — the request's own session holds a loopState: consume the finished
+    //      phase result, emit the next spawn ToolCall or the final answer.
+    //   3. NEW PARENT — no stored session: map the spawn tool + interpret + spawn(planify).
+    //      Mapping failure (no subagent tool) returns null and falls through to the classic
+    //      inline agent loop below — the fail-safe that guarantees no request ever breaks.
+    // Everything else (no tools, FASE 2 native delegation, standalone chats) is served by the
+    // classic inline agent loop exactly as before.
+    const envelope = parseSubagentEnvelope(messages);
+    let subagentUpdate: { parentSessionId: string; agentId: string } | null = null;
+
+    if (envelope) {
+      const parent = store.get(envelope.envelope.parent_session_id);
+      if (parent?.loopState) {
+        const binding: SubagentBinding = { agentId: envelope.envelope.agent_id, phase: envelope.envelope.phase };
+        if (isSubagentContinuation(messages, envelope.index)) {
+          subagentUpdate = { parentSessionId: parent.sessionId, agentId: binding.agentId };
+          log.info(`subagent continuation: parent=${parent.sessionId} agent_id=${binding.agentId} phase=${binding.phase} — serving as a normal request`);
+        } else {
+          // First request of this subagent: register the binding (lets its follow-up requests
+          // route even after the spawn prompt is no longer the last message) and run the phase.
+          if (sessionId) {
+            parent.subagentBindings = {
+              ...(parent.subagentBindings ?? {}),
+              [sessionId]: { parentSessionId: parent.sessionId, agentId: binding.agentId, phase: binding.phase },
+            };
+          }
+          store.save(parent);
+          await handleSubagentPhase({
+            provider,
+            state: parent.loopState,
+            binding,
+            model: concreteModel,
+            tools: body.tools,
+            tool_choice: body.tool_choice,
+            stream: !!body.stream,
+            reply: reply as unknown as FastifyReply,
+            log,
+            traceId,
+            abort_signal: abortController.signal,
+          });
+          log.info(`request done (subagent phase): parent=${parent.sessionId} agent_id=${binding.agentId} phase=${binding.phase} stream=${!!body.stream} elapsed=${Date.now() - requestStart}ms`);
+          return;
+        }
+      } else {
+        log.warn(`subagent envelope but parent ${envelope.envelope.parent_session_id} has no loop state (TTL eviction?) — serving as a normal request`);
+      }
+    } else if (session?.loopState && sessionId) {
+      // PARENT RESUME: no upstream call happens here — the phase already ran in the subagent's
+      // request; we only consume the stored result and emit the next spawn (or the final answer).
+      const orchestrator = new SubagentOrchestrator(provider, log);
+      const outcome = orchestrator.resume(session.loopState, sessionId);
+      const finalResult = toFinalResult(session.loopState, outcome);
+      if (body.stream) {
+        const writer = new SseWriter(reply as unknown as FastifyReply, log);
+        const sink = new SinkAdapter(writer);
+        if (outcome.kind === 'tool_call' && outcome.toolCall) {
+          sink.emitReasoningDelta(0, `[orchestrator] delegating phase "${session.loopState.stage} (round ${session.loopState.round})" to a subagent\n`);
+          sink.emitToolCalls([outcome.toolCall]);
+        } else {
+          sink.emitContent(0, outcome.finalOutput);
+        }
+        finalizeAiStream(writer, outcome.decision);
+        reply.raw.write('data: [DONE]\n\n');
+        reply.raw.end();
+        log.info(`request done (orchestrator resume, stream): decision=${outcome.decision} frames=${writer.frames} elapsed=${Date.now() - requestStart}ms`);
+      } else {
+        reply.send(toOpenAICompletion(concreteModel, finalResult, traceId));
+        log.info(`request done (orchestrator resume): decision=${outcome.decision} elapsed=${Date.now() - requestStart}ms`);
+      }
+      if (outcome.kind === 'tool_call' && outcome.toolCall) {
+        store.save({ ...session, loopState: session.loopState, pendingToolCalls: [outcome.toolCall], updatedAt: Date.now() });
+      } else {
+        store.delete(sessionId);
+      }
+      return;
+    } else if (body.tools && body.tools.length > 0 && sessionId && !session) {
+      // NEW PARENT: orchestrator mode. `started === null` (the client offers no subagent-spawn
+      // tool, or the model could not map it) -> fall through to the inline agent loop below.
+      const state = newLoopState({
+        originalInstruction: instruction,
+        internalMessages: toInternalMessages(messages),
+        max_rounds: body.max_rounds ?? 10,
+        tools: body.tools,
+        tool_choice: body.tool_choice,
+        spec: null,
+      });
+      let writerRef: SseWriter | undefined;
+      const started = await new SubagentOrchestrator(provider, log).start({
+        state,
+        sessionId,
+        model: concreteModel,
+        makeSink: () => {
+          writerRef = new SseWriter(reply as unknown as FastifyReply, log);
+          return new SinkAdapter(writerRef!);
+        },
+        traceId,
+        abort_signal: abortController.signal,
+      });
+      if (started) {
+        const { outcome } = started;
+        const finalResult = toFinalResult(state, outcome);
+        if (body.stream && writerRef) {
+          const sink = started.sink ?? new SinkAdapter(writerRef);
+          if (outcome.kind === 'tool_call' && outcome.toolCall) {
+            sink.emitReasoningDelta(0, `[orchestrator] delegating phase "${state.stage} (round ${state.round})" to a subagent\n`);
+            sink.emitToolCalls([outcome.toolCall]);
+          } else {
+            sink.emitContent(0, outcome.finalOutput);
+          }
+          finalizeAiStream(writerRef, outcome.decision);
+          reply.raw.write('data: [DONE]\n\n');
+          reply.raw.end();
+          log.info(`request done (orchestrator start, stream): decision=${outcome.decision} frames=${writerRef.frames} elapsed=${Date.now() - requestStart}ms`);
+        } else if (!body.stream) {
+          reply.send(toOpenAICompletion(concreteModel, finalResult, traceId));
+          log.info(`request done (orchestrator start): decision=${outcome.decision} elapsed=${Date.now() - requestStart}ms`);
+        }
+        store.save({
+          sessionId,
+          model: concreteModel,
+          tools: body.tools,
+          tool_choice: body.tool_choice,
+          pendingToolCalls: outcome.kind === 'tool_call' && outcome.toolCall ? [outcome.toolCall] : [],
+          loopState: state,
+          createdAt: Date.now(),
+          updatedAt: Date.now(),
+        });
+        return;
+      }
+      // Mapping failed — the inline agent loop below serves this request (classic FASE 2/3 path).
+    }
 
     if (body.stream) {
       const finalResult = await handleStream(provider, reply as unknown as FastifyReply, loopOpts, messages, instruction, log, traceId);
@@ -338,11 +488,13 @@ export async function createApp(options: CreateAppOptions = {}): Promise<Fastify
           `request done (stream): decision=${finalResult.decision} iterations=${finalResult.iterations_completed} ` +
           `upstream_calls=${finalResult.reasoning_traces_summary.total_upstream_calls} elapsed=${Date.now() - requestStart}ms`,
         );
+        recordSubagentResult(store, subagentUpdate, finalResult, log);
         toolDelegateBookkeeping(store, sessionId, concreteModel, body, finalResult, log);
       }
       return; // SseWriter has already written frames + ended the stream.
     } else {
       const finalResult = await runLoop(provider, undefined, loopOpts, messages, instruction);
+      recordSubagentResult(store, subagentUpdate, finalResult, log);
       toolDelegateBookkeeping(store, sessionId, concreteModel, body, finalResult, log);
       log.info(
         `request done: decision=${finalResult.decision} iterations=${finalResult.iterations_completed} ` +
@@ -353,6 +505,101 @@ export async function createApp(options: CreateAppOptions = {}): Promise<Fastify
   });
 
   return app;
+}
+
+/**
+ * FASE 6: the subagent's LAST content is the canonical phase result. After a subagent
+ * continuation request is served as a normal request, record its final content into the
+ * parent's stored phase result (last content wins — the subagent may have iterated internally).
+ */
+function recordSubagentResult(
+  store: SessionStore,
+  subagentUpdate: { parentSessionId: string; agentId: string } | null,
+  finalResult: FinalResultData,
+  log: TraceLogger,
+): void {
+  if (!subagentUpdate) return;
+  const parent = store.get(subagentUpdate.parentSessionId);
+  if (!parent?.loopState) {
+    log.warn(`subagent result discarded: parent ${subagentUpdate.parentSessionId} has no loop state anymore`);
+    return;
+  }
+  parent.loopState.phaseResults[subagentUpdate.agentId] = finalResult.final_output;
+  store.save(parent);
+  log.info(
+    `subagent result recorded: parent=${subagentUpdate.parentSessionId} agent_id=${subagentUpdate.agentId} output_len=${finalResult.final_output.length}`,
+  );
+}
+
+/**
+ * FASE 6: run ONE delegated phase for a subagent's first request. The phase output is what the
+ * subagent's client receives as its assistant content (R2: content = the actual answer, reasoning
+ * = live thinking). The parent consumes it later from its stored loop state.
+ */
+async function handleSubagentPhase(params: {
+  provider: ChatProvider;
+  state: LoopStateData;
+  binding: SubagentBinding;
+  model: string;
+  tools?: ToolDefinition[];
+  tool_choice?: ToolChoice;
+  stream: boolean;
+  reply: FastifyReply;
+  log: TraceLogger;
+  traceId: string;
+  abort_signal: AbortSignal;
+}): Promise<void> {
+  const { reply, log, traceId, model, stream, abort_signal, provider, state, binding } = params;
+  const orchestrator = new SubagentOrchestrator(provider, log);
+  const start = Date.now();
+  try {
+    if (stream) {
+      const writer = new SseWriter(reply, log);
+      const sink = new SinkAdapter(writer);
+      const out = await orchestrator.runSubagentPhase({ state, binding, model, tools: params.tools, tool_choice: params.tool_choice, sink, traceId, abort_signal });
+      finalizeAiStream(writer, 'complete');
+      reply.raw.write('data: [DONE]\n\n');
+      reply.raw.end();
+      log.info(`subagent phase done (stream): phase=${binding.phase} agent_id=${binding.agentId} output_len=${out.content.length} frames=${writer.frames} elapsed=${Date.now() - start}ms`);
+    } else {
+      const out = await orchestrator.runSubagentPhase({ state, binding, model, tools: params.tools, tool_choice: params.tool_choice, traceId, abort_signal });
+      reply.send({
+        id: `chatcmpl-${Date.now().toString(36)}`,
+        object: 'chat.completion',
+        created: Math.floor(Date.now() / 1000),
+        model,
+        choices: [{ index: 0, message: { role: 'assistant', content: out.content }, finish_reason: 'stop' }],
+        usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
+        meta: { subagent_phase: binding.phase, agent_id: binding.agentId, trace_id: traceId },
+      });
+      log.info(`subagent phase done: phase=${binding.phase} agent_id=${binding.agentId} output_len=${out.content.length} elapsed=${Date.now() - start}ms`);
+    }
+  } catch (err) {
+    if (!abort_signal.aborted) log.error(`subagent phase failed: ${String(err)}`);
+    try {
+      reply.code(500).send({ error: 'subagent phase failed', detail: String(err), trace_id: traceId });
+    } catch {
+      /* stream already partially sent; the client likely disconnected */
+    }
+  }
+}
+
+/** FASE 6: fold an orchestrator outcome into the FinalResultData the OpenAI completion uses. */
+function toFinalResult(state: LoopStateData, outcome: OrchestratorOutcome): FinalResultData {
+  return {
+    final_output: outcome.finalOutput,
+    iterations_completed: state.accumulatedSteps.length,
+    decision: outcome.decision,
+    max_rounds: state.max_rounds,
+    tasks_executed: state.accumulatedSteps.map((s) => ({ id: s.task_id ?? `iter-${s.iteration}`, status: 'completed' as const, output: s.output })),
+    reasoning_traces_summary: {
+      phases_completed: [],
+      total_upstream_calls: state.totalUpstreamCalls,
+      errors_occurred: 0,
+    },
+    accumulated_context: accumulatedSummary(state.accumulatedSteps),
+    tool_calls: outcome.kind === 'tool_call' && outcome.toolCall ? [outcome.toolCall] : [],
+  };
 }
 
 /**

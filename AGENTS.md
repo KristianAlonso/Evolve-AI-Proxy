@@ -101,6 +101,20 @@ Cuando el cliente interrumpe la conexión o pide al modelo que se detenga (openc
 - Los aborts NO reintentan: `withAutoHealingRetry` recibe `abortSignal` y falla en el 1.º intento; la decisión final es `error`.
 - La desconexión silenciosa del sink (comportamiento SC-023 original) sigue rompiendo el loop con `decision='continue'`; el abort explícito registra `decision='error'`.
 
+## Delegación de fases a subagentes (FASE 6)
+
+Además del bucle inline, el proxy puede **delegar las fases planificar/ejecutar/evaluar al cliente** vía tool call de spawn estándar (wire 100% OpenAI; ver [A-006](./docs/adr/a-006-subagent-phase-delegation.md)):
+
+- **Tri-partición en `routes.ts`** (request con `tools` + `x-session-id`): (1) el prompt lleva un **envelope** `{"phase","parent_session_id","agent_id"}` en su línea 1 → es un subagente (1.ª petición = el proxy corre ESA fase con `orchestrator.runSubagentPhase()`; continuaciones = petición normal y su último `content` actualiza el resultado de la fase — *last content wins*). (2) La sesión propia lleva `loopState` → **parent resume** (sincrónico, sin upstream call): consume el resultado, emite el siguiente spawn o la respuesta final. (3) Petición nueva sin sesión guardada → `orchestrator.start()` = mapeo + interpret + spawn(planify).
+- **Fase de mapeo** (`subagent-mapper.ts`): un upstream call (máx. 2) le pide al modelo que elija entre las `tools` del cliente la herramienta que crea subagentes y mapee sus argumentos (title/type/prompt). Tools en formato **compacto** (nombre + descripción ≤300 chars + args con enums) y `max_tokens: 8192` (los modelos de razonamiento gastan el presupuesto en thinking; con 512 fallaba con `finish_reason:"length"`).
+- **`agent_id` NUNCA viaja como argumento del tool call** — solo dentro del envelope del prompt. El mapeo produce únicamente `title`/`type`/`prompt`.
+- **El tipo de subagente lo elige el modelo** en la fase de mapeo (`phase_types: {planify, execute, evaluate}`);
+- **Fail-safe**: sin herramienta de spawn o mapeo inválido → `start()` devuelve `null` → fall-through al bucle inline clásico (`AgentLoop.run()` intacto; `SseWriter` solo se crea tras un mapeo exitoso, porque su constructor tiene side effects — patrón `makeSink` factory).
+- **Endurecimiento**: si en un parent resume el resultado de la fase pendiente aún no llegó (el cliente bloqueó o no corrió el subagente), se **re-emite el mismo spawn** (mismo `agent_id`) sin avanzar rondas — un subagente bloqueado nunca gira el bucle con salidas vacías.
+- **Estado serializable**: `LoopStateData` (`loop-state.ts`) vive en la sesión del padre (`SessionStore`, TTL 30 min) junto con `subagentBindings` (subagent-session → {parent, agent_id, phase}).
+- **Prompts compartidos**: `phase-prompts.ts` es la única fuente de los prompts de fase y la shaping de mensajes (R1: roles `assistant` preservados; fallback *rendered* ante rechazo 4xx, sticky). Bucle inline y orquestador usan los mismos builders, por lo que los routers de los stubs y el live coinciden.
+- **Verificado live** con `opencode` + `opencode-swarm` (218 tools, `llama_cpp/default`): mapeo exitoso en el 1.º intento (`task` + `explorer`/`coder`/`reviewer`), spawn de `planify (round N)` en el wire, resumes de ~10 ms, re-emisión estable con subagentes bloqueados por el plugin cliente.
+
 ## Principios para trabajar en este proyecto
 
 1. **Validation primero.** Todo request debe validarse contra un schema JSON antes de procesarse.
@@ -111,7 +125,8 @@ Cuando el cliente interrumpe la conexión o pide al modelo que se detenga (openc
 
 | Recurso | Estado |
 | --------- | -------- |
-| [README.md](./README.md) | Básico — solo nombre del proyecto |
+| [README.md](./README.md) | Documentación completa del proxy (arquitectura, streaming, FASE 6, configuración) |
 | [LICENSE.md](./LICENSE.md) | Apache 2.0 |
 | [CONTRIBUTING.md](./CONTRIBUTING.md) | No existe |
-| [docs/adr/index.md](./docs/adr/index.md) | **Nuevo** — Índice de decisiones arquitecturales |
+| [docs/adr/index.md](./docs/adr/index.md) | Índice de decisiones arquitecturales (A-001…A-006) |
+| [plans/subagent-phase-delegation.md](./plans/subagent-phase-delegation.md) | Plan FASE 6 — Delegación de fases a subagentes |

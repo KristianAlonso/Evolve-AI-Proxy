@@ -9,6 +9,7 @@ Registro de decisiones arquitecturales que han dado forma al diseño y la evoluc
 | [A-001](./a-001-lenguaje-y-framework-principal.md) | Lenguaje y Framework Principal | **Aceptada** | Node.js + Fastify como stack principal por rendimiento, validación nativa y hooks del lifecycle. |
 | [A-002](./a-002-proveedores-soportados.md) | Proveedores Soportados | **Aceptada** | Endpoint unificado `POST /v1/chat/completions` compatible con OpenAI API para Ollama, Anthropic y Google Gemini. |
 | [A-003](./a-003-patron-agentico-iterativo.md) | Patrón Agéntico Iterativo | **Aceptada** | Sistema de interpretación → planificación → ejecución → evaluación en bucle controlado para resolver solicitudes complejas. |
+| [A-006](./a-006-subagent-phase-delegation.md) | Delegación de Fases a Subagentes | **Aceptada** | Las fases planificar/ejecutar/evaluar se delegan al cliente vía tool call de spawn (formato OpenAI estándar); estado serializable en `SessionStore`; degradación segura al bucle inline. |
 
 ## Formato de los ADRs
 

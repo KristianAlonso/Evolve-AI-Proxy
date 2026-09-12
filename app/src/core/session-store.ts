@@ -11,6 +11,7 @@
 // state lives here. TTL-pruned so a client that never comes back cannot leak memory.
 
 import type { ToolCall, ToolChoice, ToolDefinition } from '../types.js';
+import type { LoopStateData } from './loop-state.js';
 
 /** One in-flight tool-delegation session. */
 export interface ToolDelegateSession {
@@ -22,6 +23,14 @@ export interface ToolDelegateSession {
   tool_choice?: ToolChoice;
   /** The tool calls the client still owes results for. */
   pendingToolCalls: ToolCall[];
+  /** FASE 6: resumable orchestrator state for subagent phase delegation (orchestrator mode only). */
+  loopState?: LoopStateData;
+  /**
+   * FASE 6: subagent x-session-id -> binding into the parent loop, so a subagent's follow-up
+   * (continuation) requests route correctly even after the spawn prompt is no longer the last
+   * message in its conversation.
+   */
+  subagentBindings?: Record<string, { parentSessionId: string; agentId: string; phase: string }>;
   createdAt: number;
   updatedAt: number;
 }
