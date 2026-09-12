@@ -1,6 +1,8 @@
 // Entry point. Importing this module never starts a server — only running it directly does.
 // This import-safety (ADRs A-001) lets the test suite `createApp()` in-process.
 
+// MUST be first: populates process.env from app/.env before config.ts reads it at import time.
+import './env.js';
 import { createApp } from './routes.js';
 import env from './config.js';
 import type { ChatProvider } from './provider/types.js';
