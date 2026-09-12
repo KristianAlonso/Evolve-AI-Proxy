@@ -25,7 +25,7 @@ La decisión (FASE 6) es convertir las tres fases no-iniciales (planificar / eje
 | **Envelope de spawn** | Prompt del tool call: línea 1 = JSON `{"phase","parent_session_id","agent_id"}`, línea 2 vacía, línea 3+ = descripción de la tarea. `agent_id` **nunca** viaja como argumento del tool call — solo dentro del envelope (evita depender del schema del tool del cliente). | `src/core/subagent-spawn.ts` |
 | **Orquestador** | Máquina de estados `planify → execute → evaluate → [siguiente ronda] | done`, serializable en `LoopStateData` (vive en la sesión del padre en `SessionStore`, TTL 30 min). `start()` = mapeo + interpret + spawn(planify). `resume()` = consume el resultado de la fase y emite el siguiente spawn o la respuesta final (**sincrónico**, sin upstream call). `runSubagentPhase()` = ejecuta UNA fase para la primera petición del subagente. | `src/core/orchestrator.ts` |
 | **Tri-partición en routes** | (1) El prompt lleva un envelope → es un subagente (primera petición = correr la fase; continuaciones = petición normal, su último contenido actualiza el resultado de la fase — *last content wins*). (2) La sesión propia lleva `loopState` → parent resume. (3) Petición nueva con tools + `x-session-id` y sin sesión guardada → `orchestrator.start()`. Si el mapeo falla (`null`) → **fall-through al bucle inline clásico** (comportamiento FASE 2/3 intacto). | `src/routes.ts` |
-| **Endurecimiento (live run)** | En `resume()`, si el resultado de la fase pendiente **aún no llegó** (el cliente bloqueó o no ejecutó el subagente), el proxy **re-emite el mismo spawn** (mismo `agent_id`) sin consumir el estado: las rondas solo avanzan con un resultado real, de modo que un subagente bloqueado nunca hace girar el bucle con salidas vacías. **Failover de tipo:** tras `SPAWN_RETRY_THRESHOLD` (3) re-emisiones sin resultado, el orquestador rota al **siguiente tipo disponible** (el mapeo guarda todos los tipos) y re-dispara con un `agent_id` nuevo. El tipo que por fin produce un resultado queda **fijado para el resto de la sesión**. Sin candidatos más, se queda re-emitiendo de forma estable. | `src/core/orchestrator.ts` |
+| **Endurecimiento (live run)** | En `resume()`, si el resultado de la fase pendiente **aún no llegó** (el cliente bloqueó o no ejecutó el subagente), las rondas no avanzan: solo se avanza con un resultado real, de modo que un subagente bloqueado nunca hace girar el bucle con salidas vacías. **Failover de tipo (inmediato):** **cada fallo** reintenta **de inmediato con el siguiente tipo** de `spec.availableTypes` (round-robin con wrap-around) y un `agent_id` nuevo; con un solo tipo disponible, re-emite el mismo spawn de forma estable (mismo `agent_id`). El tipo que por fin produce un resultado queda **fijado para el resto de la sesión**. | `src/core/orchestrator.ts` |
 
 ### Formato de resultado canónico
 
@@ -39,14 +39,12 @@ El resultado de una fase es el **último** `content` del subagente (no el primer
 
 En `resume()`, el resultado de la fase pendiente es el de la sesión (`phaseResults`):
 
-- **Resultado disponible** → se consume (last content wins), se avanza la máquina de estados, y si el
-  spawn en curso es el mismo agente se resetea el contador de re-emisiones (el tipo queda fijado).
-- **Sin resultado** (el cliente bloqueó o no ejecutó el subagente) → el proxy **re-emite el mismo
-  spawn** (mismo `agent_id`) sin consumir el estado; el contador `spawnRetries` crece. Tras
-  `SPAWN_RETRY_THRESHOLD` re-emisiones sin resultado (configurable vía la variable de entorno
-  `SPAWN_RETRY_THRESHOLD`, por defecto 3), si quedan tipos disponibles, se rota al
-  siguiente y se re-dispara con un `agent_id` nuevo. Sin candidatos más, se queda re-emitiendo de
-  forma estable.
+- **Resultado disponible** → se consume (last content wins), se avanza la máquina de estados, se
+  resetea el contador de fallos consecutivos y el tipo activo queda **fijado** para el resto de la sesión.
+- **Sin resultado** (el cliente bloqueó o no ejecutó el subagente) → el proxy **no** avanza la
+  máquina de estados y, si hay **más de un tipo** en `spec.availableTypes`, **reintenta de
+  inmediato con el siguiente tipo** (round-robin, wrap al primero) y un `agent_id` nuevo. Con un
+  único tipo disponible, re-emite el **mismo** spawn (mismo `agent_id`) de forma estable.
 
 ### Detección de drift de la lista de tipos (re-mapeo entre peticiones)
 

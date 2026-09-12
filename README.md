@@ -118,7 +118,6 @@ Todas definidas en `app/src/config.ts` (y `logger.ts`), con su valor por defecto
 | `CONSOLE_LOG` | `true` | Espejar cada línea de log a stdout/stderr. |
 | `CAPTURE_DIR` | `./captures` | Directorio de capturas (request entrante + `upstream/`). |
 | `CAPTURE_REQUESTS` | `true` | Habilitar capturas JSON a disco. |
-| `SPAWN_RETRY_THRESHOLD` | `3` | **FASE 6:** re-emisiones del mismo spawn de fase (sin resultado) toleradas antes del failover al siguiente tipo de subagente. |
 | `FORCE_COLOR` | *(off)* | Forzar color ANSI aunque la salida no sea TTY. |
 | `NO_COLOR` | *(off)* | Desactivar color ANSI aunque sea TTY. |
 

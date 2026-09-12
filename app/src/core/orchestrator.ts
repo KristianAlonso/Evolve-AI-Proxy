@@ -23,7 +23,6 @@
 
 import type { ChatProvider } from '../provider/types.js';
 import type { TraceLogger } from '../logger.js';
-import env from '../config.js';
 import type { LoopDecision, TaskResult, ToolCall, ToolChoice, ToolDefinition, UpstreamMessage } from '../types.js';
 import { mapSubagentTool } from './subagent-mapper.js';
 import { interpretRequest } from './interpreter.js';
@@ -41,14 +40,6 @@ import {
 import { buildSpawnToolCall, newAgentId, type DelegatedPhase } from './subagent-spawn.js';
 import type { LoopStateData } from './loop-state.js';
 import type { LoopSink } from './agent-loop.js';
-
-/**
- * How many consecutive spawn re-emissions of the SAME pending phase (without any phase result
- * arriving) are tolerated before the orchestrator rotates to the next available subagent type
- * from `spec.availableTypes` (failover). The type that finally yields a phase result is pinned
- * for the rest of the session. Configurable via the `SPAWN_RETRY_THRESHOLD` env var (default 3).
- */
-export const SPAWN_RETRY_THRESHOLD: number = env.SPAWN_RETRY_THRESHOLD;
 
 /** One delegated subagent: its agent_id + the phase it is running. */
 export interface SubagentBinding {
@@ -134,34 +125,32 @@ export class SubagentOrchestrator {
       const agentId = state.pendingAgentId;
       const phaseResult = agentId ? state.phaseResults[agentId] : undefined;
       if (agentId && phaseResult === undefined) {
-        // The subagent's phase result has not arrived yet (the client has not run the subagent —
-        // e.g. its plugin blocked the dispatch). Re-emit the SAME spawn (same agent_id) WITHOUT
-        // consuming the stage; rounds only advance once the parent holds a real phase result, so
-        // a blocked/missing subagent can never spin the loop with empty output.
+        // The subagent's phase result has not arrived: the client has not run the subagent (its
+        // plugin blocked the dispatch, or it errored out). Rounds only advance once the parent
+        // holds a real phase result, so a blocked/missing subagent can never spin the loop with
+        // empty output.
         //
-        // FAILOVER: after SPAWN_RETRY_THRESHOLD re-emissions with no result, the active subagent
-        // type is considered broken — rotate to the next available type (most general first) and
-        // re-dispatch with a FRESH agent id. The type that finally yields a result is pinned.
+        // FAILOVER: on EVERY failure, when more than one subagent type is available, retry with
+        // the NEXT type (round-robin over `spec.availableTypes`, wraps around) and a FRESH agent
+        // id. With a single available type there is nothing to rotate to — re-emit the SAME
+        // spawn (same agent_id) stably.
         state.spawnRetries += 1;
-        if (state.spawnRetries >= SPAWN_RETRY_THRESHOLD) {
-          const nextType = this.nextFailoverType(state);
-          if (nextType) {
-            this.logger.warn(
-              `orchestrator failover: type="${state.activeTypeId}" never produced a phase result after ${state.spawnRetries - 1} re-emits — ` +
-              `retrying with type="${nextType}" (stage=${state.stage} round=${state.round})`,
-            );
-            state.activeTypeId = nextType;
-            state.spawnRetries = 0;
-            return {
-              kind: 'tool_call',
-              toolCall: this.emitSpawn(state, sessionId),
-              decision: 'tool_calls_pending',
-              finalOutput: '',
-            };
-          }
+        const nextType = this.nextFailoverType(state);
+        if (nextType) {
+          this.logger.warn(
+            `orchestrator failover: type="${state.activeTypeId}" produced no phase result (consecutive_failures=${state.spawnRetries}) — ` +
+            `retrying with a different type="${nextType}" (stage=${state.stage} round=${state.round})`,
+          );
+          state.activeTypeId = nextType;
+          return {
+            kind: 'tool_call',
+            toolCall: this.emitSpawn(state, sessionId),
+            decision: 'tool_calls_pending',
+            finalOutput: '',
+          };
         }
         this.logger.info(
-          `orchestrator resume: no phase result yet for agent_id=${agentId} (retries=${state.spawnRetries}/${SPAWN_RETRY_THRESHOLD}) — re-emitting spawn (stage=${state.stage} round=${state.round})`,
+          `orchestrator resume: no phase result yet for agent_id=${agentId} (consecutive_failures=${state.spawnRetries}, single type="${state.activeTypeId}") — re-emitting spawn (stage=${state.stage} round=${state.round})`,
         );
         return {
           kind: 'tool_call',
@@ -358,15 +347,16 @@ export class SubagentOrchestrator {
   }
 
   /**
-   * Failover: the next available subagent type (ordered most general-purpose first). Null when
-   * the current type is already the last one — in that case the orchestrator keeps re-emitting
-   * the same spawn forever (stable, no further rotation possible).
+   * Failover: the NEXT subagent type in round-robin over `spec.availableTypes` (wraps to the
+   * first after the last). Null when at most one type is available — then there is nothing to
+   * rotate to and the orchestrator keeps re-emitting the same spawn (stable).
    */
   private nextFailoverType(state: LoopStateData): string | null {
     const types = state.spec?.availableTypes ?? [];
+    if (types.length < 2) return null;
     const idx = types.findIndex((t) => t.id === state.activeTypeId);
-    if (idx >= 0 && idx + 1 < types.length) return types[idx + 1].id;
-    return null;
+    const next = idx === -1 ? 0 : (idx + 1) % types.length;
+    return types[next].id;
   }
 
   /** The "current task" description that rides in the spawn prompt (after the envelope line). */

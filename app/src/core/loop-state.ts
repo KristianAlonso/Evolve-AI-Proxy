@@ -29,11 +29,12 @@ export interface LoopStateData {
   spec: SubagentSpawnSpec | null;
   /**
    * The single subagent type currently in use for this session (set from `spec.typeId` at start;
-   * rotated to the next `spec.availableTypes` entry when the active type keeps failing, and pinned
-   * for the rest of the session once it yields a phase result).
+   * on EVERY failed spawn (no phase result) it rotates to the next `spec.availableTypes` entry
+   * in round-robin when more than one type is available, and is pinned for the rest of the
+   * session once it yields a phase result).
    */
   activeTypeId: string;
-  /** Consecutive spawn re-emissions of the pending phase without a result (failover counter). */
+  /** Consecutive failed spawns (no phase result) of the pending phase; reset on a real result. */
   spawnRetries: number;
   interpretation: Interpretation | null;
   /** The current AgentTask for the round (set after the planify phase result is consumed). */

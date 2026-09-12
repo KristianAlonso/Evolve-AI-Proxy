@@ -18,7 +18,7 @@ import {
   type SubagentSpawnSpec,
 } from '../core/subagent-spawn.js';
 import { mapSubagentTool } from '../core/subagent-mapper.js';
-import { SPAWN_RETRY_THRESHOLD, SubagentOrchestrator, type OrchestratorOutcome } from '../core/orchestrator.js';
+import { SubagentOrchestrator, type OrchestratorOutcome } from '../core/orchestrator.js';
 import { newLoopState, type LoopStateData } from '../core/loop-state.js';
 import { stub } from './stub-provider.js';
 
@@ -457,67 +457,82 @@ describe('subagent orchestrator', () => {
     expect(state.stage).toBe('done');
   });
 
-  it('resume(): missing phase result re-emits the same spawn WITHOUT advancing (blocked client)', () => {
+  it('resume(): missing phase result does NOT advance the stage, rotates to the next type (fresh agent id) and the result still lands', () => {
     const orchestrator = new SubagentOrchestrator(stub(), log);
     const state = makeState();
     state.pendingAgentId = 'agent-p1';
 
+    // FIRST failure → immediate failover to the next type, FRESH agent id, stage/round untouched.
     const first = orchestrator.resume(state, 'ses_parent_1');
     expect(first.kind).toBe('tool_call');
-    expect(first.toolCall!.id).toBe('spawn_agent-p1');
+    expect(first.toolCall!.id).toBe(`spawn_${state.pendingAgentId}`);
+    expect(state.pendingAgentId).not.toBe('agent-p1');
+    expect(JSON.parse(first.toolCall!.function.arguments).subagent_type).toBe('build');
     expect(state.stage).toBe('planify'); // unchanged
     expect(state.round).toBe(1); // unchanged
-    expect(state.pendingAgentId).toBe('agent-p1'); // same agent id, not a fresh one
 
-    // A second resume without a result is stable too (idempotent re-emit).
-    const second = orchestrator.resume(state, 'ses_parent_1');
-    expect(second.kind).toBe('tool_call');
-    expect(second.toolCall!.id).toBe('spawn_agent-p1');
-    expect(state.stage).toBe('planify');
-    expect(state.round).toBe(1);
-
-    // Once the result arrives, the machine advances from the same position.
-    state.phaseResults['agent-p1'] = JSON.stringify({ description: 'A real step' });
+    // Once the (re-dispatched) subagent delivers a result, the machine advances from the same position.
+    state.phaseResults[state.pendingAgentId!] = JSON.stringify({ description: 'A real step' });
     const third = orchestrator.resume(state, 'ses_parent_1');
     expect(third.kind).toBe('tool_call');
     expect(state.stage).toBe('execute');
     expect(state.task!.description).toBe('A real step');
+    expect(state.spawnRetries).toBe(0); // reset by the real result
   });
 
-  it('resume(): after SPAWN_RETRY_THRESHOLD re-emits without a result, rotates to the NEXT type with a fresh agent id (failover)', () => {
+  it('resume(): EVERY failure rotates to the NEXT type immediately (round-robin over available types)', () => {
     const orchestrator = new SubagentOrchestrator(stub(), log);
-    const state = makeState();
+    const state = makeState(); // availableTypes = [plan, build, critic], active = plan
     state.pendingAgentId = 'agent-a';
     expect(state.activeTypeId).toBe('plan');
 
-    // Re-emits BEFORE the threshold: same type, same agent id, stage/round untouched.
-    for (let i = 1; i < SPAWN_RETRY_THRESHOLD; i++) {
-      const out = orchestrator.resume(state, 'ses_parent_1');
-      expect(out.kind).toBe('tool_call');
-      expect(out.toolCall!.id).toBe('spawn_agent-a');
-      expect(JSON.parse(out.toolCall!.function.arguments).subagent_type).toBe('plan');
-    }
-    expect(state.activeTypeId).toBe('plan');
+    // Failure #1 → immediate failover to the next type, FRESH agent id.
+    const first = orchestrator.resume(state, 'ses_parent_1');
+    expect(first.kind).toBe('tool_call');
+    expect(state.activeTypeId).toBe('build');
+    expect(state.pendingAgentId).not.toBe('agent-a');
+    expect(first.toolCall!.id).toBe(`spawn_${state.pendingAgentId}`);
+    expect(JSON.parse(first.toolCall!.function.arguments).subagent_type).toBe('build');
+    expect(state.spawnRetries).toBe(1);
     expect(state.stage).toBe('planify');
 
-    // Resume #SPAWN_RETRY_THRESHOLD: failover to the next available type, FRESH agent id.
-    const rotated = orchestrator.resume(state, 'ses_parent_1');
-    expect(state.activeTypeId).toBe('build');
-    expect(rotated.kind).toBe('tool_call');
-    expect(state.pendingAgentId).not.toBe('agent-a');
-    expect(rotated.toolCall!.id).toBe(`spawn_${state.pendingAgentId}`);
-    expect(JSON.parse(rotated.toolCall!.function.arguments).subagent_type).toBe('build');
-    expect(state.spawnRetries).toBe(0);
+    // Failure #2 → rotates again to the next type (fresh agent id again).
+    const idAfterFirst = state.pendingAgentId!;
+    const second = orchestrator.resume(state, 'ses_parent_1');
+    expect(state.activeTypeId).toBe('critic');
+    expect(JSON.parse(second.toolCall!.function.arguments).subagent_type).toBe('critic');
+    expect(state.pendingAgentId).not.toBe(idAfterFirst); // fresh id each failure
 
-    // Walking the list again reaches the LAST type — after it, rotation stops (no candidates left)
-    // and re-emission stays stable on the same agent id.
-    for (let i = 0; i < SPAWN_RETRY_THRESHOLD - 1; i++) orchestrator.resume(state, 'ses_parent_1');
+    // Failure #3 → WRAPS AROUND to the first type.
+    const third = orchestrator.resume(state, 'ses_parent_1');
+    expect(state.activeTypeId).toBe('plan');
+    expect(JSON.parse(third.toolCall!.function.arguments).subagent_type).toBe('plan');
+
+    // Consecutive-failure counter grows and resets only on a real result.
+    state.phaseResults[state.pendingAgentId!] = JSON.stringify({ description: 'A real step' });
     orchestrator.resume(state, 'ses_parent_1');
-    expect(state.activeTypeId).toBe('critic');
-    const idAtLast = state.pendingAgentId!;
-    const stuck = orchestrator.resume(state, 'ses_parent_1');
-    expect(state.activeTypeId).toBe('critic');
-    expect(stuck.toolCall!.id).toBe(`spawn_${idAtLast}`);
+    expect(state.spawnRetries).toBe(0);
+    expect(state.activeTypeId).toBe('plan'); // pinned after the successful result
+  });
+
+  it('resume(): with a SINGLE available type, failures stay stable (same agent id, no rotation)', () => {
+    const orchestrator = new SubagentOrchestrator(stub(), log);
+    const state = makeState();
+    state.spec = { ...state.spec!, availableTypes: [{ id: 'plan', description: 'Plans work' }] };
+    state.activeTypeId = 'plan';
+    state.pendingAgentId = 'agent-only';
+
+    const first = orchestrator.resume(state, 'ses_parent_1');
+    expect(first.kind).toBe('tool_call');
+    expect(first.toolCall!.id).toBe('spawn_agent-only'); // same agent id, idempotent re-emit
+    expect(state.activeTypeId).toBe('plan');
+    expect(state.pendingAgentId).toBe('agent-only');
+    expect(state.stage).toBe('planify');
+
+    // Second failure: still stable.
+    const second = orchestrator.resume(state, 'ses_parent_1');
+    expect(second.toolCall!.id).toBe('spawn_agent-only');
+    expect(state.spawnRetries).toBe(2);
   });
 
   it('resume(): after a drift re-mapping (new spec + activeTypeId), spawns use the new type', () => {
@@ -559,12 +574,12 @@ describe('subagent orchestrator', () => {
     expect(state.stage).toBe('execute');
   });
 
-  it('resume(): a real phase result resets the retry counter and pins the current type', () => {
+  it('resume(): a real phase result resets the failure counter and pins the current type', () => {
     const orchestrator = new SubagentOrchestrator(stub(), log);
     const state = makeState();
     state.pendingAgentId = 'agent-a';
     state.activeTypeId = 'build'; // pretend we already failed over once
-    state.spawnRetries = SPAWN_RETRY_THRESHOLD - 1; // one re-emit away from rotation
+    state.spawnRetries = 2; // two consecutive failures before this result arrived
 
     // The result arrives BEFORE the next resume: no rotation, counter reset, type pinned.
     state.phaseResults['agent-a'] = JSON.stringify({ description: 'A real step' });
