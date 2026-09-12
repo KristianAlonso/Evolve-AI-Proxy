@@ -4,6 +4,7 @@
 import type { ChatProvider } from '../provider/types.js';
 import type { NormalizedResult, UpstreamMessage, TaskResult } from '../types.js';
 import { callWithStreaming, type LiveEmitter } from './stream-helper.js';
+import type { TraceLogger } from '../logger.js';
 
 const YES_PATTERNS = /(^|[\s([:punct:]])yes|true|completed|done|complete|sí|si[^l]|affirmative|correcta(?:mente)?/i;
 const NO_PATTERNS = /\bno\b|false|not complete|incomplete|no\b.*still|\bsimilar\b/i;
@@ -54,7 +55,7 @@ export async function evaluateTask(
   originalInstruction: string,
   accumulatedContext: string,
   taskResult: TaskResult,
-  options?: { model: string | null; max_tokens?: number },
+  options?: { model: string | null; max_tokens?: number; logger?: TraceLogger; traceId?: string; abort_signal?: AbortSignal },
   emitter?: LiveEmitter,
 ): Promise<{ decision: 'complete' | 'continue'; reasoning: string; streamed: boolean }> {
   const prompt = buildEvaluatePrompt(originalInstruction, accumulatedContext, taskResult);
@@ -62,7 +63,7 @@ export async function evaluateTask(
     provider,
     model: options?.model ?? null, // concrete user-selected model — never "auto" (no-auto rule)
     messages: prompt,
-    options: { max_tokens: options?.max_tokens ?? 128 },
+    options: { max_tokens: options?.max_tokens ?? 128, logger: options?.logger, trace_id: options?.traceId, abort_signal: options?.abort_signal },
     surfaceDelta: emitter ? (chunk) => {
       const reasoning = typeof chunk.reasoning === 'string' ? chunk.reasoning : '';
       if (reasoning !== '') emitter.emitReasoningDelta(0, reasoning);

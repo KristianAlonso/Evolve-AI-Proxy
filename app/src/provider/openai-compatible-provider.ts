@@ -5,11 +5,13 @@
 // cares whether it is talking to raw fetch or the SDK: per-turn reasoning/refusal extraction, token
 // usage, and a live delta stream for the agent loop to surface in real time (SC-009 / SC-012).
 
+import { mkdirSync, writeFileSync } from 'node:fs';
 import { createOpenAICompatible } from '@ai-sdk/openai-compatible';
 import env from '../config.js';
-import { createLogger } from '../logger.js';
+import { createLogger, type TraceLogger } from '../logger.js';
 import type { NormalizedResult, ToolCall, ToolChoice, ToolDefinition, UpstreamMessage } from '../types.js';
 import { validateRequest } from '../validate.js';
+import { isAbortError } from './types.js';
 import type { ChatProvider, ProviderCallOptions, UpstreamModel, StreamChunk } from './types.js';
 
 /** The SDK chat model handle returned by a call to `.chatModel(id)`. */
@@ -42,7 +44,7 @@ function createSdkClient(baseUrl: string, apiKey: string | undefined): ProviderC
 export class OpenAICompatibleProvider implements ChatProvider {
   private baseUrl: string;
   private apiKey: string | undefined;
-  private logger = createLogger('upstream');
+  private logger: TraceLogger;
   private modelsCache: UpstreamModel[] | null = null;
   private client?: ProviderClient;
   private readonly createClient: ClientFactory;
@@ -53,10 +55,14 @@ export class OpenAICompatibleProvider implements ChatProvider {
     // Injectable so tests can drive the forwarding/normalization logic with a fake chat model
     // instead of mocking global fetch (the SDK owns transport and its own SSE parsing).
     createClient: ClientFactory = createSdkClient,
+    // Traced request logger (routes passes one bound to the request's trace id) so every
+    // upstream call lands in the same audit trail as the request that triggered it.
+    logger?: TraceLogger,
   ) {
     this.baseUrl = baseUrl.replace(/\/$/, '');
     this.apiKey = apiKey;
     this.createClient = createClient;
+    this.logger = logger ?? createLogger('upstream');
   }
 
   /** Lazily build the SDK client (one-time) so it carries a consistent base URL / API key. */
@@ -69,6 +75,7 @@ export class OpenAICompatibleProvider implements ChatProvider {
 
   async listModels(): Promise<UpstreamModel[]> {
     if (this.modelsCache) return this.modelsCache;
+    const t0 = Date.now();
     try {
       const res = await fetch(`${this.baseUrl}/v1/models`, {
         headers: this.apiKey ? { Authorization: `Bearer ${this.apiKey}` } : {},
@@ -76,10 +83,47 @@ export class OpenAICompatibleProvider implements ChatProvider {
       if (!res.ok) throw new Error(`/v1/models returned HTTP ${res.status}`);
       const json = (await res.json()) as { data?: UpstreamModel[] };
       this.modelsCache = json.data ?? [];
+      this.logger.info(`models fetched: ${this.modelsCache.length} model(s) in ${Date.now() - t0}ms from ${this.baseUrl}`);
       return this.modelsCache;
     } catch (e) {
-      this.logger.warn(`models fetch failed: ${(e as Error).message}`);
+      this.logger.warn(`models fetch failed (${Date.now() - t0}ms): ${(e as Error).message}`);
       return [];
+    }
+  }
+
+  // ---- Upstream call capture (SC-025 debugging): dump every request sent to the model API and
+  // ---- every response/error back, to `CAPTURE_DIR/upstream/<utc>_<traceId>_<kind>.json`, so the
+  // ---- exact wire content (messages + tool schemas, not just names) is inspectable on disk.
+  private captureUpstream(
+    kind: 'request' | 'response' | 'error',
+    model: string | null,
+    messages: UpstreamMessage[],
+    options: ProviderCallOptions | undefined,
+    data: Record<string, unknown>,
+  ): void {
+    if (!env.CAPTURE_REQUESTS) return;
+    try {
+      const entry = {
+        kind,
+        timestamp: new Date().toISOString(),
+        model: model ?? null,
+        trace_id: options?.trace_id ?? null,
+        request: {
+          messages,
+          tools: options?.tools ?? [],
+          tool_choice: options?.tool_choice ?? null,
+          max_tokens: options?.max_tokens ?? null,
+          temperature: options?.temperature ?? null,
+        },
+        data,
+      };
+      const stamp = new Date().toISOString().replace(/[:.]/g, '-');
+      const trace = options?.trace_id ?? 'notrace';
+      const file = `${env.CAPTURE_DIR}/upstream/${stamp}_${trace}_${kind}.json`;
+      mkdirSync(`${env.CAPTURE_DIR}/upstream`, { recursive: true });
+      writeFileSync(file, JSON.stringify(entry, null, 2));
+    } catch {
+      /* captures are debugging aids — they must never crash a call */
     }
   }
 
@@ -107,15 +151,58 @@ export class OpenAICompatibleProvider implements ChatProvider {
       /* the target validates upstream; this is only defensive */
     }
 
-    const result = await this.getClient().chatModel(model).doGenerate({
-      prompt: toV4Messages(messages) as V4Prompt,
-      // Forward the caller's per-call knobs into v4 call options so they reach the upstream request
-      // body (the SDK maps max_tokens -> maxOutputTokens, temperature, tools, toolChoice, etc.).
-      // Omitted fields stay undefined and are dropped from the body — no change to defaults.
-      ...forwardOptions(options),
-    });
+    const callLog = options?.logger ?? this.logger;
+    const t0 = Date.now();
+    callLog.debug(
+      `upstream request (buffered): model=${model} messages=${messages.length} ` +
+      `tools=${options?.tools?.length ? options.tools.map((t) => t.function.name).join(',') : '-'}`,
+    );
+    this.captureUpstream('request', model, messages, options, { buffered: true });
+    try {
+      const result = await this.getClient().chatModel(model).doGenerate({
+        prompt: toV4Messages(messages) as V4Prompt,
+        // Forward the caller's per-call knobs into v4 call options so they reach the upstream request
+        // body (the SDK maps max_tokens -> maxOutputTokens, temperature, tools, toolChoice, etc.).
+        // Omitted fields stay undefined and are dropped from the body — no change to defaults.
+        ...forwardOptions(options),
+        // Stop propagation (SC-023): a client disconnect / explicit stop cancels the fetch to the
+        // upstream API in flight instead of letting it run to completion for a dead client.
+        abortSignal: options?.abort_signal,
+      });
 
-    return this.toNormalized(result);
+      const norm = this.toNormalized(result);
+      callLog.info(
+        `upstream response (buffered): model=${model} ${Date.now() - t0}ms ` +
+        `content_len=${norm.content?.length ?? 0} reasoning_len=${norm.reasoning.length} ` +
+        `tool_calls=${norm.tool_calls.length ? norm.tool_calls.map((c) => c.function.name).join(',') : '-'} ` +
+        `finish=${norm.finish_reason ?? '-'} ` +
+        `tokens=${norm.usage ? `in=${norm.usage.prompt_tokens} out=${norm.usage.completion_tokens}` : '-'}`,
+      );
+      this.captureUpstream('response', model, messages, options, {
+        buffered: true,
+        duration_ms: Date.now() - t0,
+        finish_reason: norm.finish_reason,
+        content: norm.content,
+        reasoning: norm.reasoning,
+        tool_calls: norm.tool_calls,
+        usage: norm.usage,
+      });
+      return norm;
+    } catch (err) {
+      // The SDK wraps aborts in opaque APIErrors ("Failed to process successful response"), so the
+      // signal flag is the reliable indicator, not just the error shape.
+      if (isAbortError(err) || options?.abort_signal?.aborted) {
+        callLog.warn(`upstream aborted (buffered): model=${model} ${Date.now() - t0}ms — client stopped the request`);
+      } else {
+        callLog.error(`upstream request failed (buffered): model=${model} ${Date.now() - t0}ms: ${(err as Error).message}`);
+      }
+      this.captureUpstream('error', model, messages, options, {
+        buffered: true,
+        duration_ms: Date.now() - t0,
+        error: String(err instanceof Error ? err.message : err),
+      });
+      throw err;
+    }
   }
 
   /**
@@ -141,30 +228,85 @@ export class OpenAICompatibleProvider implements ChatProvider {
       );
     }
 
-    const result = await this.getClient().chatModel(model).doStream({
-      prompt: toV4Messages(messages) as V4Prompt,
-      ...forwardOptions(opts?.options),
-    });
+    const callLog = opts?.options?.logger ?? this.logger;
+    const t0 = Date.now();
+    let textDeltas = 0;
+    let reasoningDeltas = 0;
+    const streamedToolCalls: string[] = [];
+    // Accumulated output kept ONLY for the on-disk response capture (the stream itself still
+    // forwards each delta verbatim to onChunk — no buffering of the live path).
+    let accContent = '';
+    let accReasoning = '';
+    const accToolCalls: ToolCall[] = [];
+    callLog.debug(
+      `upstream request (stream): model=${model} messages=${messages.length} ` +
+      `tools=${opts?.options?.tools?.length ? opts.options.tools.map((t) => t.function.name).join(',') : '-'}`,
+    );
+    this.captureUpstream('request', model, messages, opts?.options, { buffered: false });
+    try {
+      const result = await this.getClient().chatModel(model).doStream({
+        prompt: toV4Messages(messages) as V4Prompt,
+        ...forwardOptions(opts?.options),
+        // Stop propagation (SC-023): cancel the in-flight upstream stream on client abort.
+        abortSignal: opts?.options?.abort_signal,
+      });
 
-    for await (const part of result.stream as AsyncIterable<{ type: string; delta?: string; toolCallId?: string; toolName?: string; input?: unknown }>) {
-      if (part.type === 'text-delta') {
-        onChunk({ content: part.delta ?? null, reasoning: null });
-      } else if (part.type === 'reasoning-delta') {
-        onChunk({ reasoning: part.delta ?? null, content: null });
-      } else if (part.type === 'tool-call') {
-        // A finalized native tool call (FASE 2): the SDK has already accumulated its argument
-        // deltas. We emit the COMPLETE call in one chunk so the client receives a robust,
-        // parseable tool call rather than incremental argument fragments.
-        onChunk({
-          content: null,
-          reasoning: null,
-          tool_call: {
+      for await (const part of result.stream as AsyncIterable<{ type: string; delta?: string; toolCallId?: string; toolName?: string; input?: unknown }>) {
+        if (part.type === 'text-delta') {
+          textDeltas++;
+          const delta = part.delta ?? '';
+          accContent += delta;
+          onChunk({ content: delta, reasoning: null });
+        } else if (part.type === 'reasoning-delta') {
+          reasoningDeltas++;
+          const delta = part.delta ?? '';
+          accReasoning += delta;
+          onChunk({ reasoning: delta, content: null });
+        } else if (part.type === 'tool-call') {
+          // A finalized native tool call (FASE 2): the SDK has already accumulated its argument
+          // deltas. We emit the COMPLETE call in one chunk so the client receives a robust,
+          // parseable tool call rather than incremental argument fragments.
+          streamedToolCalls.push(part.toolName ?? '?');
+          const tc: ToolCall = {
             id: part.toolCallId ?? '',
             type: 'function',
             function: { name: part.toolName ?? '', arguments: stringifyArguments(part.input) },
-          },
-        });
+          };
+          accToolCalls.push(tc);
+          onChunk({ content: null, reasoning: null, tool_call: tc });
+        }
       }
+
+      callLog.info(
+        `upstream response (stream): model=${model} ${Date.now() - t0}ms ` +
+        `text_deltas=${textDeltas} reasoning_deltas=${reasoningDeltas} ` +
+        `tool_calls=${streamedToolCalls.length ? streamedToolCalls.join(',') : '-'}`,
+      );
+      this.captureUpstream('response', model, messages, opts?.options, {
+        buffered: false,
+        duration_ms: Date.now() - t0,
+        text_deltas: textDeltas,
+        reasoning_deltas: reasoningDeltas,
+        content: accContent,
+        reasoning: accReasoning,
+        tool_calls: accToolCalls,
+      });
+    } catch (err) {
+      // The SDK wraps aborts in opaque APIErrors ("Failed to process successful response"), so the
+      // signal flag is the reliable indicator, not just the error shape.
+      if (isAbortError(err) || opts?.options?.abort_signal?.aborted) {
+        callLog.warn(`upstream aborted (stream): model=${model} ${Date.now() - t0}ms — client stopped the request`);
+      } else {
+        callLog.error(`upstream request failed (stream): model=${model} ${Date.now() - t0}ms: ${(err as Error).message}`);
+      }
+      this.captureUpstream('error', model, messages, opts?.options, {
+        buffered: false,
+        duration_ms: Date.now() - t0,
+        partial_content: accContent,
+        partial_reasoning: accReasoning,
+        error: String(err instanceof Error ? err.message : err),
+      });
+      throw err;
     }
   }
 

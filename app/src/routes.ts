@@ -11,12 +11,14 @@
 // SC-018: non-stream returns an OpenAI-style chat.completion JSON object; stream emits SSE
 //         events (phases, reasoning, task results) through SseWriter during a single run().
 
+import { mkdirSync, writeFileSync } from 'node:fs';
 import { fastify as makeFastify } from 'fastify';import type {
+  FastifyError,
   FastifyInstance,
   FastifyRequest,
   FastifyReply,
 } from 'fastify';
-import { createLogger } from './logger.js';
+import { createLogger, newTraceId, paint, statusColor, type TraceLogger } from './logger.js';
 import { validateRequest, type ValidationResult } from './validate.js';
 import { AgentLoop, type FinalResultData, type LoopOptions } from './core/agent-loop.js';
 import { OpenAICompatibleProvider } from './provider/openai-compatible-provider.js';
@@ -55,7 +57,7 @@ function finishReason(decision: LoopDecision): { reason: string; refused: boolea
 }
 
 /** OpenAI-compatible chat.completion object (SC-018) from a finished loop result. */
-function toOpenAICompletion(model: string, finalResult: FinalResultData): Record<string, unknown> {
+function toOpenAICompletion(model: string, finalResult: FinalResultData, traceId: string): Record<string, unknown> {
   const { reason, refused } = finishReason(finalResult.decision);
   return {
     id: `chatcmpl-${Date.now().toString(36)}`,
@@ -80,8 +82,20 @@ function toOpenAICompletion(model: string, finalResult: FinalResultData): Record
       max_rounds: finalResult.max_rounds,
       upstream_calls: finalResult.reasoning_traces_summary.total_upstream_calls,
       refused,
+      trace_id: traceId,
     },
   };
+}
+
+/**
+ * Resolve the request's trace id: an incoming `x-trace-id` header is honoured (bounded to keep log
+ * lines sane); otherwise the proxy mints one. Every log line of the request carries it, and it is
+ * echoed back in the `x-trace-id` response header (and in `meta.trace_id` on the JSON path).
+ */
+function readTraceId(headers: Record<string, unknown>): string {
+  const incoming = headers['x-trace-id'];
+  if (typeof incoming === 'string' && incoming.length > 0 && incoming.length <= 128) return incoming;
+  return newTraceId();
 }
 
 /**
@@ -152,19 +166,111 @@ export async function createApp(options: CreateAppOptions = {}): Promise<Fastify
   // ---- /health ----
   app.get('/health', async () => ({ status: 'ok' }));
 
+  // ---- Incoming-connection log: every request (any route) is logged with its remote address
+  // ---- and trace id the moment it arrives, before any processing. The same `x-trace-id` header
+  // ---- policy as the chat route: honoured from the client if sane, minted otherwise.
+  app.addHook('onRequest', async (request: FastifyRequest, reply: FastifyReply) => {
+    const traceId = readTraceId(request.headers);
+    reply.header('x-trace-id', traceId);
+    // Per-request scratch for the onResponse summary (elapsed + stream type).
+    (request as FastifyRequest & { requestMeta?: { start: number; stream: boolean | undefined; traceId?: string } }).requestMeta = {
+      start: Date.now(),
+      stream: undefined, // filled in by the chat handler once the body is known
+      traceId,
+    };
+    const endpoint = request.routeOptions?.url ?? request.url;
+    logger.traced(traceId).info(
+      `incoming: ${request.ip} ${request.method} ${endpoint} (HTTP/${request.raw.httpVersion})`,
+    );
+  });
+
+  // ---- Live colored request-result line (console only; the file keeps its plain audit lines). ----
+  app.addHook('onResponse', async (request: FastifyRequest, reply: FastifyReply) => {
+    const status = reply.statusCode;
+    const endpoint = request.routeOptions?.url ?? request.url;
+    const streamType = (request as FastifyRequest & { requestMeta?: { stream?: boolean } }).requestMeta?.stream;
+    const streamLabel = streamType === undefined ? paint('stream=-', 'cyan') : paint(streamType ? 'stream=yes' : 'stream=no', streamType ? 'cyan' : 'magenta');
+    const elapsed = Date.now() - ((request as FastifyRequest & { requestMeta?: { start?: number } }).requestMeta?.start ?? Date.now());
+    const fileMsg = `request completed: ${request.method} ${endpoint} (HTTP/${request.raw.httpVersion}) stream=${streamType === undefined ? '-' : streamType ? 'yes' : 'no'} -> ${status} elapsed=${elapsed}ms`;
+    const consoleLine = `${request.ip} ${request.method} ${endpoint} (HTTP/${request.raw.httpVersion}) ${streamLabel} -> ${statusColor(status)} (${elapsed}ms)`;
+    // Correlate with the exact trace id the client saw (onRequest's, or the chat handler's once
+    // it re-stamps it) so the result line joins the same grep family.
+    const traceId = (request as FastifyRequest & { requestMeta?: { traceId?: string } }).requestMeta?.traceId;
+    (traceId ? createLogger('http').traced(traceId) : createLogger('http')).requestResult(fileMsg, consoleLine);
+  });
+
+  // ---- Every error — malformed JSON from the body parser (which dies BEFORE preValidation can
+  // ---- inspect it), validation 400s, and unexpected 500s — is logged with its trace id and
+  // ---- answered with Fastify's standard error body. No error is ever a silent 4xx/5xx. ----
+  app.setErrorHandler((error: FastifyError, request: FastifyRequest, reply: FastifyReply) => {
+    const traceId = readTraceId(request.headers);
+    const status = error.statusCode && error.statusCode >= 400 && error.statusCode < 500 ? error.statusCode : 500;
+    logger.traced(traceId).error(
+      `error ${status} on ${request.method} ${request.url}: ${error.message}`,
+    );
+    if (status < 500) {
+      reply.status(status).send({
+        statusCode: status,
+        code: error.code,
+        error: status === 400 ? 'Bad Request' : String(status),
+        message: error.message,
+      });
+    } else {
+      reply.status(500).send({
+        statusCode: 500,
+        code: error.code,
+        error: 'Internal Server Error',
+        message: 'An internal error occurred',
+      });
+    }
+  });
+
   // ---- SC-024: validate ALL request fields at once, before any loop logic runs. ----
-  app.addHook('preValidation', async (request: FastifyRequest) => {
+  app.addHook('preValidation', async (request: FastifyRequest, reply: FastifyReply) => {
     if (!request.url.startsWith('/v1/chat/completions')) return;
+    const traceId = readTraceId(request.headers);
+    reply.header('x-trace-id', traceId);
     const result: ValidationResult = validateRequest(request.body);
     if (result.ok) return;
     const message = result.issues.map((i) => `${i.field}: ${i.message}`).join('; ');
+    logger.traced(traceId).error(`request rejected (400 validation): ${message}`);
     throw Object.assign(new Error(message), { statusCode: 400, httpCode: 400 });
   });
 
   app.post('/v1/chat/completions', async (request, reply) => {
+    // Tracing (SC-025): one trace id per request, threaded through every layer (routes -> loop ->
+    // provider -> SSE writer) and echoed back so clients can correlate logs with their requests.
+    const traceId = readTraceId(request.headers);
+    const log: TraceLogger = logger.traced(traceId);
+    reply.header('x-trace-id', traceId);
+    const requestStart = Date.now();
+
     const body = request.body as Partial<ProxyRequest>;
+    // Record the stream type + final trace id for the onResponse result line.
+    (request as FastifyRequest & { requestMeta?: { stream?: boolean; traceId?: string } }).requestMeta!.stream = !!body.stream;
+    (request as FastifyRequest & { requestMeta?: { traceId?: string } }).requestMeta!.traceId = traceId;
+
+    // Stop propagation (SC-023): one AbortController per request. When the client interrupts the
+    // connection — a hard disconnect or the user asking the model to STOP (opencode cuts the HTTP
+    // stream) — it is aborted: the in-flight upstream API call is cancelled (no more tokens
+    // generated for a dead client) and the AgentLoop breaks at its next checkpoint.
+    const abortController = new AbortController();
+    reply.raw.once('close', () => {
+      if (!reply.raw.writableEnded) {
+        log.warn(`client aborted: trace_id=${traceId} — cancelling upstream call and stopping AgentLoop`);
+        abortController.abort('client disconnect');
+      }
+    });
+
     const provider: ChatProvider =
-      options.provider ?? new OpenAICompatibleProvider(options.baseUrl, options.apiKey);
+      options.provider ?? new OpenAICompatibleProvider(options.baseUrl, options.apiKey, undefined, log);
+
+    log.info(
+      `POST /v1/chat/completions: model="${(body.model ?? '').trim()}" stream=${!!body.stream} ` +
+      `messages=${(body.messages ?? []).length} tools=${body.tools?.length ?? 0} ` +
+      `tool_choice=${body.tool_choice ?? '-'} session=${sessionIdOf(request)}`,
+    );
+    captureRequest({ traceId, request, body, log });
 
     // The model comes from the request body, and only from `body.model` — there is no header-based
     // override on this route. It still stands alone for every client, so resolveUpstreamModel() maps
@@ -192,6 +298,9 @@ export async function createApp(options: CreateAppOptions = {}): Promise<Fastify
     };
 
     const concreteModel = await resolveUpstreamModel(model, await readModelsOnce(provider));
+    const models = await readModelsOnce(provider);
+    const resolution = describeModelResolution(model, concreteModel, models);
+    log.info(`model resolution: "${model}" -> "${concreteModel}" (${resolution})`);
 
     // Map evolve controls down to orchestrator options. `tools`/`tool_choice` carry the client's
     // delegated tools (FASE 2): only the loop's execute step forwards them to the upstream.
@@ -203,7 +312,11 @@ export async function createApp(options: CreateAppOptions = {}): Promise<Fastify
       model: concreteModel,
       tools: body.tools,
       tool_choice: body.tool_choice,
+      logger: log,
+      traceId,
+      abort_signal: abortController.signal,
     };
+    log.info(`loop configured: max_rounds=${loopOpts.max_rounds} max_retries=${loopOpts.max_retries} context_window=${loopOpts.context_window_size}`);
 
     const messages = (body.messages ?? []) as UpstreamMessage[];
 
@@ -219,13 +332,23 @@ export async function createApp(options: CreateAppOptions = {}): Promise<Fastify
     const store = options.sessionStore ?? defaultSessionStore;
 
     if (body.stream) {
-      const finalResult = await handleStream(provider, reply as unknown as FastifyReply, loopOpts, messages, instruction);
-      if (finalResult) toolDelegateBookkeeping(store, sessionId, concreteModel, body, finalResult);
+      const finalResult = await handleStream(provider, reply as unknown as FastifyReply, loopOpts, messages, instruction, log, traceId);
+      if (finalResult) {
+        log.info(
+          `request done (stream): decision=${finalResult.decision} iterations=${finalResult.iterations_completed} ` +
+          `upstream_calls=${finalResult.reasoning_traces_summary.total_upstream_calls} elapsed=${Date.now() - requestStart}ms`,
+        );
+        toolDelegateBookkeeping(store, sessionId, concreteModel, body, finalResult, log);
+      }
       return; // SseWriter has already written frames + ended the stream.
     } else {
       const finalResult = await runLoop(provider, undefined, loopOpts, messages, instruction);
-      toolDelegateBookkeeping(store, sessionId, concreteModel, body, finalResult);
-      reply.send(toOpenAICompletion(concreteModel, finalResult));
+      toolDelegateBookkeeping(store, sessionId, concreteModel, body, finalResult, log);
+      log.info(
+        `request done: decision=${finalResult.decision} iterations=${finalResult.iterations_completed} ` +
+        `upstream_calls=${finalResult.reasoning_traces_summary.total_upstream_calls} elapsed=${Date.now() - requestStart}ms`,
+      );
+      reply.send(toOpenAICompletion(concreteModel, finalResult, traceId));
     }
   });
 
@@ -244,6 +367,7 @@ function toolDelegateBookkeeping(
   model: string,
   body: Partial<ProxyRequest>,
   finalResult: FinalResultData,
+  log: TraceLogger,
 ): void {
   if (!sessionId) return;
   if (finalResult.decision === 'tool_calls_pending') {
@@ -256,9 +380,94 @@ function toolDelegateBookkeeping(
       createdAt: Date.now(),
       updatedAt: Date.now(),
     });
+    log.info(`session store: saved pending tool delegation for session=${sessionId} (${finalResult.tool_calls.length} call(s))`);
   } else {
     store.delete(sessionId);
+    log.info(`session store: cleared session=${sessionId} (terminal decision=${finalResult.decision})`);
   }
+}
+
+/** Log-friendly summary of how the incoming model id resolved (exact / auto-resolve / fallback). */
+function describeModelResolution(bodyModel: string, concrete: string, models: UpstreamModel[]): string {
+  if (concrete === bodyModel) return 'exact';
+  if (models.some((m) => m.id === concrete)) return 'auto-resolve';
+  return 'fallback';
+}
+
+/**
+ * Debugging interceptor (SC-025 companion): dump the FULL incoming request to one JSON file under
+ * `env.CAPTURE_DIR`, named `<utc-timestamp>_<traceId>.json`. Lets us inspect exactly what a client
+ * (e.g. opencode) sent — every tool schema, every message — to diagnose issues like the execute
+ * phase overflowing a small model's context window. Never crashes the request; disabled with
+ * `CAPTURE_REQUESTS=false`.
+ */
+function captureRequest(params: {
+  traceId: string;
+  request: FastifyRequest;
+  body: Partial<ProxyRequest>;
+  log: TraceLogger;
+}): void {
+  if (!env.CAPTURE_REQUESTS) return;
+  try {
+    const body = params.body;
+    const messages = Array.isArray(body.messages) ? body.messages : [];
+    const tools = Array.isArray(body.tools) ? body.tools : [];
+    const raw = JSON.stringify(body);
+    // Very rough token estimate (~4 chars/token) — good enough to spot a 100k-token request blow-up.
+    const charCount = raw.length;
+    const entry = {
+      trace_id: params.traceId,
+      timestamp: new Date().toISOString(),
+      ip: params.request.ip,
+      method: params.request.method,
+      url: params.request.url,
+      session: sessionIdOf(params.request),
+      headers: sanitizeHeaders(params.request.headers),
+      summary: {
+        model: body.model ?? '',
+        stream: !!body.stream,
+        message_count: messages.length,
+        messages: messages.map((m) => ({
+          role: m.role,
+          chars: typeof m.content === 'string' ? m.content.length : JSON.stringify(m.content ?? null)?.length ?? 0,
+          tool_calls: Array.isArray(m.tool_calls) ? m.tool_calls.length : 0,
+          tool_call_id: m.tool_call_id ?? null,
+        })),
+        tool_count: tools.length,
+        tool_names: tools.map((t) => t.function.name),
+        tool_choice: body.tool_choice ?? null,
+        body_chars: charCount,
+        est_tokens: Math.round(charCount / 4),
+      },
+      body,
+    };
+    mkdirSync(env.CAPTURE_DIR, { recursive: true });
+    const stamp = new Date().toISOString().replace(/[:.]/g, '-');
+    const file = `${env.CAPTURE_DIR}/${stamp}_${params.traceId}.json`;
+    writeFileSync(file, JSON.stringify(entry, null, 2));
+    params.log.info(`request captured to ${file} (est ${entry.summary.est_tokens} tokens, ${tools.length} tools)`);
+  } catch (err) {
+    params.log.warn(`request capture failed: ${String(err)}`);
+  }
+}
+
+/** Headers minus secrets: Authorization/api keys are masked so captures are safe to share. */
+function sanitizeHeaders(headers: Record<string, unknown>): Record<string, string> {
+  const out: Record<string, string> = {};
+  for (const [k, v] of Object.entries(headers)) {
+    const key = k.toLowerCase();
+    if (typeof v !== 'string') continue;
+    out[key] = key === 'authorization' || key === 'x-api-key' || key === 'proxy-authorization'
+      ? `<redacted ${v.length} chars>`
+      : v;
+  }
+  return out;
+}
+
+/** Session id from the standard affinity header, or '-' for the request log line. */
+function sessionIdOf(request: FastifyRequest): string {
+  const raw = request.headers['x-session-id'];
+  return typeof raw === 'string' && raw.length > 0 ? raw : '-';
 }
 
 /** Run the agent loop without a sink (non-stream path). */
@@ -279,11 +488,15 @@ async function handleStream(
   provider: ChatProvider,
   reply: FastifyReply,
   opts: LoopOptions,
-  messages: UpstreamMessage[] ,
+  messages: UpstreamMessage[],
   instruction: string,
+  log: TraceLogger,
+  traceId: string,
 ): Promise<FinalResultData | undefined> {
-  const writer = new SseWriter(reply);
+  const writer = new SseWriter(reply, log);
   const sink = new SinkAdapter(writer);
+  const streamStart = Date.now();
+  log.info(`stream start: frames so far=0`);
   try {
     // Extract the final decision off the loop result so we can emit a matching finish chunk.
     const result = await runLoop(provider, sink, opts, messages, instruction);
@@ -295,15 +508,18 @@ async function handleStream(
     // own — end() flushes the final bytes and signals EOF to the client (and to `inject()`), which a
     // normal SSE stream does when it finishes. Without this the reply stays pending forever.
     reply.raw.end();
+    log.info(`stream end: frames=${writer.frames} elapsed=${Date.now() - streamStart}ms decision=${result.decision}`);
     return result;
   } catch (err) {
     if (!sink.isDisconnected()) {
-      logger.error(`stream error: ${String(err)}`);
+      log.error(`stream error (frames=${writer.frames}, elapsed=${Date.now() - streamStart}ms): ${String(err)}`);
       try {
-        reply.code(500).send({ error: 'agent loop failed', detail: String(err) });
+        reply.code(500).send({ error: 'agent loop failed', detail: String(err), trace_id: traceId });
       } catch {
         /* stream already partially sent; the client likely disconnected */
       }
+    } else {
+      log.warn(`stream aborted by client disconnect: frames=${writer.frames} elapsed=${Date.now() - streamStart}ms`);
     }
   }
   return undefined;

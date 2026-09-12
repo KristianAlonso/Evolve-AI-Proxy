@@ -30,6 +30,9 @@ export async function withAutoHealingRetry(
   options: {
     maxRetries?: number; // default 3 (SC-013)
     doomLoopThreshold?: number; // SC-012
+    /** Stop propagation (SC-023): when the client aborts mid-run, an aborted upstream call must
+     * NOT burn the retry budget — fail fast with the abort error. */
+    abortSignal?: AbortSignal;
   },
 ): Promise<WithRetryOutcome> {
   const maxRetries = options.maxRetries ?? 3;
@@ -67,7 +70,13 @@ export async function withAutoHealingRetry(
     } catch (err) {
       const error = err instanceof Error ? err.message : String(err);
       lastError = error;
-      if (exhausted) return finishFailure(attempts, traces, error, lastDoomed);
+      // Deterministic upstream errors (bad request, context-window overflow, auth) fail
+      // identically on every retry — burning the retry budget on them just adds latency with
+      // zero chance of healing. Aborted calls are the same: the client stopped, retrying a dead
+      // request is pointless. Fail fast with the original error in all three cases.
+      if (options.abortSignal?.aborted || isDeterministicUpstreamError(error) || exhausted) {
+        return finishFailure(attempts, traces, error, lastDoomed);
+      }
       traces.push({ attempt, error, reasoning: '' });
     }
   }
@@ -109,6 +118,16 @@ function finishFailure(
     traces,
     tool_calls: [],
   };
+}
+
+/**
+ * True for upstream errors where re-sending the SAME request cannot possibly succeed: bad
+ * requests, context-window overflows, auth failures, unknown models. (429 is borderline — we
+ * treat it as deterministic too, since this retry has no backoff and would hammer the same
+ * rate limit.)
+ */
+export function isDeterministicUpstreamError(error: string): boolean {
+  return /abort|ContextWindowExceeded|exceeds the available context size|context (window|length)|invalid[_ ]api[_ ]key|Unauthorized|HTTP 4\d\d|\b40[0134]\b|BadRequest|UnsupportedOperation|model_not_found|UnknownModel/i.test(error);
 }
 
 /** Build an autocorrecting prompt that names the specific error (SC-013). */

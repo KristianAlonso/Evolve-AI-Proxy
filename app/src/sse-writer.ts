@@ -3,6 +3,7 @@
 // and surfaces client-disconnect so the orchestrator can abort immediately.
 
 import type { FastifyReply } from 'fastify';
+import { createLogger, type TraceLogger } from './logger.js';
 import type { ToolCall } from './types.js';
 
 /** Event names surfaced to clients (SC-009). */
@@ -38,9 +39,13 @@ let idCounter = 0;
 export class SseWriter {
   private connected = true;
   private readonly reply: FastifyReply;
+  private readonly logger: TraceLogger;
+  /** Count of chat-completion.chunk frames emitted (logged at stream end for traceability). */
+  frames = 0;
 
-  constructor(reply: FastifyReply) {
+  constructor(reply: FastifyReply, logger?: TraceLogger) {
     this.reply = reply;
+    this.logger = logger ?? createLogger('sse');
     // Ensure the response is a proper SSE stream with correct headers.
     reply.type('text/event-stream');
     reply.header('Cache-Control', 'no-cache, no-transform');
@@ -139,6 +144,7 @@ export class SseWriter {
    * what must be produced — no proprietary frame may ever reach the wire here.
    */
   public emitAiChunk(choice: { index: number; delta: Record<string, unknown>; finishReason?: string }): void {
+    this.frames++;
     const payload = JSON.stringify({
       id: this.id,
       object: 'chat.completion.chunk',

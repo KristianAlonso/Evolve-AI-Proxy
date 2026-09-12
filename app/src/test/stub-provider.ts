@@ -10,7 +10,7 @@
 //
 // A "no network" requirement — every call is served locally, no upstream access.
 
-import type { ChatProvider, StreamChunk, UpstreamModel } from '../provider/types.js';
+import type { ChatProvider, ProviderCallOptions, StreamChunk, UpstreamModel } from '../provider/types.js';
 import type { NormalizedResult, ToolCall, UpstreamMessage } from '../types.js';
 
 export interface StubRecord {
@@ -29,6 +29,33 @@ const DEFAULT_EXECUTE: NormalizedResult = {
   finish_reason: 'stop',
   raw: {},
 };
+
+/** An AbortError-like rejection for a client stop (SC-023 / stop propagation). */
+function abortError(reason?: unknown): Error {
+  const e = new Error(`This operation was aborted: ${reason instanceof Error ? reason.message : String(reason ?? 'abort')}`);
+  e.name = 'AbortError';
+  return e;
+}
+
+/** Resolve like `p` but reject with AbortError if `signal` aborts first (client stop, SC-023). */
+function respectAbort<T>(p: Promise<T>, signal?: AbortSignal): Promise<T> {
+  if (!signal) return p;
+  if (signal.aborted) return Promise.reject(abortError(signal.reason));
+  return new Promise<T>((resolve, reject) => {
+    const onAbort = () => reject(abortError(signal.reason));
+    signal.addEventListener('abort', onAbort, { once: true });
+    p.then(
+      (v) => {
+        signal.removeEventListener('abort', onAbort);
+        resolve(v);
+      },
+      (e) => {
+        signal.removeEventListener('abort', onAbort);
+        reject(e);
+      },
+    );
+  });
+}
 
 function baseRouter(opts?: {
   interpretation?: Record<string, unknown>;
@@ -85,9 +112,10 @@ export function stub(opts?: {
 }): ChatProvider & { calls: StubRecord[] } {
   const record: StubRecord[] = [];
   const provider = baseRouter(opts);
-  const complete = (model: string | null, messages: UpstreamMessage[]): Promise<NormalizedResult> => {
+  const complete = (model: string | null, messages: UpstreamMessage[], options?: ProviderCallOptions): Promise<NormalizedResult> => {
     record.push({ model, messages });
-    return Promise.resolve(provider(messages));
+    // Stop propagation (SC-023): honour the caller's AbortSignal like the real provider's fetch.
+    return respectAbort(Promise.resolve(provider(messages)), options?.abort_signal);
   };
   return Object.assign(
     {
@@ -120,13 +148,13 @@ export function streamingStub(opts?: {
     async listModels() {
       return [] as UpstreamModel[];
     },
-    async complete(model, messages) {
+    async complete(model, messages, options?: ProviderCallOptions) {
       record.push({ model, messages });
-      return router(messages);
+      return respectAbort(Promise.resolve(router(messages)), options?.abort_signal);
     },
     async completeStream(model, messages, opts?: { options?: unknown; onChunk?: (c: StreamChunk) => void }) {
       record.push({ model, messages });
-      const res = await router(messages);
+      const res = await respectAbort(Promise.resolve(router(messages)), (opts?.options as ProviderCallOptions | undefined)?.abort_signal);
       const onChunk = opts?.onChunk;
       if (!onChunk) return;
       const reasoning = res.reasoning ?? '';

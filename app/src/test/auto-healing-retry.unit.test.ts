@@ -42,6 +42,19 @@ describe('withAutoHealingRetry (SC-013/014)', () => {
     expect(outcome.traces.length).toBe(2);
   });
 
+  it('fails fast on deterministic upstream errors (no retry budget wasted)', async () => {
+    let calls = 0;
+    const outcome = await withAutoHealingRetry(async () => {
+      calls += 1;
+      throw new Error('litellm.ContextWindowExceededError: OpenAIException - request (115734 tokens) exceeds the available context size (105216 tokens)');
+    }, { maxRetries: 3 });
+
+    expect(calls).toBe(1); // no retries for a deterministic 4xx
+    expect(outcome.result.status).toBe('failed');
+    expect(outcome.result.error).toContain('ContextWindowExceeded');
+    expect(outcome.traces.length).toBe(0);
+  });
+
   it('detects a doom-loop and still stops with a partial result', async () => {
     let calls = 0;
     const outcome = await withAutoHealingRetry(async () => {

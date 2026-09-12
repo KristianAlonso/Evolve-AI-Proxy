@@ -6,6 +6,7 @@
 import type { ChatProvider } from '../provider/types.js';
 import type { NormalizedResult, UpstreamMessage, ToolCall } from '../types.js';
 import { callWithStreaming, type LiveEmitter } from './stream-helper.js';
+import type { TraceLogger } from '../logger.js';
 
 export interface Interpretation {
   mainObjective: string;
@@ -18,7 +19,7 @@ export async function interpretRequest(
   provider: ChatProvider,
   messages: UpstreamMessage[],
   buildPrompt: (messages: UpstreamMessage[]) => string,
-  options?: { model: string | null; max_tokens?: number },
+  options?: { model: string | null; max_tokens?: number; logger?: TraceLogger; traceId?: string; abort_signal?: AbortSignal },
   emitter?: LiveEmitter,
 ): Promise<{ interpretation: Interpretation; reasoning: string; streamed: boolean }> {
   const instruction = [
@@ -44,7 +45,7 @@ export async function interpretRequest(
     provider,
     model: options?.model ?? null, // concrete user-selected model — never "auto" (no-auto rule)
     messages: promptMessages,
-    options: { max_tokens: options?.max_tokens ?? 512 },
+    options: { max_tokens: options?.max_tokens ?? 512, logger: options?.logger, trace_id: options?.traceId, abort_signal: options?.abort_signal },
     surfaceDelta: emitter ? (chunk) => {
       const reasoning = typeof chunk.reasoning === 'string' ? chunk.reasoning : '';
       if (reasoning !== '') emitter.emitReasoningDelta(0, reasoning);

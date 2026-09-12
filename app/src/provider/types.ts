@@ -2,6 +2,7 @@
 // on the concrete OpenAI-compatible implementation, so tests can inject a stub.
 
 import type { NormalizedResult, ToolCall, ToolChoice, ToolDefinition, UpstreamMessage } from '../types.js';
+import type { TraceLogger } from '../logger.js';
 
 /** A model advertised by /v1/models (only what we need from it). */
 export interface UpstreamModel {
@@ -17,6 +18,34 @@ export interface ProviderCallOptions {
   /** Client-side tools to delegate (FASE 2); forwarded to the upstream `tools` parameter. */
   tools?: ToolDefinition[];
   tool_choice?: ToolChoice;
+  /**
+   * Traced request logger (SC-025). Passed per call so a shared/singleton provider still logs every
+   * upstream request under the trace id of the request that triggered it. Not forwarded upstream —
+   * provider-internal only; `forwardOptions()` ignores it.
+   */
+  logger?: TraceLogger;
+  /**
+   * Request trace id (SC-025). Used to name upstream request/response captures so one `grep`-able
+   * file family per trace id. Provider-internal only; `forwardOptions()` ignores it.
+   */
+  trace_id?: string;
+  /**
+   * Abort signal that cancels the in-flight upstream call (stop propagation, SC-023): when the
+   * client interrupts (disconnect or an explicit "stop"), the routes layer aborts it and the
+   * provider's underlying fetch is cancelled. Provider-internal only.
+   */
+  abort_signal?: AbortSignal;
+}
+
+/**
+ * True when an error is an AbortError (fetch/stream cancelled through an AbortSignal — client
+ * stop). Duck-typed on name/message (no instanceof): SDKs throw AbortError instances that may
+ * not share the local Error prototype chain.
+ */
+export function isAbortError(err: unknown): boolean {
+  if (typeof err !== 'object' || err === null) return false;
+  const e = err as { name?: string; message?: string };
+  return e.name === 'AbortError' || /abort/i.test(e.name ?? '') || /abort/i.test(e.message ?? '');
 }
 
 /**

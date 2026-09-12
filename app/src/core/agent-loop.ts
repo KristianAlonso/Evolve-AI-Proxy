@@ -3,8 +3,9 @@
 // evaluate binary decision -> (context condensing) -> repeat until complete or max_rounds.
 // Emits typed SSE events through a LoopSink; results are also returned for the non-stream path.
 
+import { isAbortError } from '../provider/types.js';
 import type { ChatProvider } from '../provider/types.js';
-import { createLogger } from '../logger.js';
+import { createLogger, type TraceLogger } from '../logger.js';
 import type { Phase, SSEEvent } from '../sse-writer.js';
 import type { AgentTask, LoopDecision, TaskResult, ToolCall, ToolChoice, ToolDefinition, UpstreamMessage } from '../types.js';
 import { interpretRequest, type Interpretation } from './interpreter.js';
@@ -40,6 +41,17 @@ export interface LoopOptions {
    *  planning and evaluation keep their internal structured prompts tool-free. */
   tools?: ToolDefinition[];
   tool_choice?: ToolChoice;
+  /** Traced request logger (routes passes one bound to the request's trace id). Falls back to a
+   *  session-only logger when absent (tests, in-process use). */
+  logger?: TraceLogger;
+  /** Raw trace id of the originating HTTP request (for upstream request/response captures). */
+  traceId?: string;
+  /**
+   * Abort signal for the whole run (stop propagation, SC-023): when the client interrupts the
+   * connection or asks the model to stop, the routes layer aborts it — every in-flight upstream
+   * call is cancelled and the loop breaks at the next checkpoint without wasting retries.
+   */
+  abort_signal?: AbortSignal;
 }
 
 export interface LoopTrace {
@@ -76,7 +88,7 @@ type ExecStep = () => Promise<{
 export class AgentLoop {
   private provider: ChatProvider;
   private sink?: LoopSink;
-  private logger;
+  private logger: TraceLogger;
   private ctxManager = new ContextManager(4096);
   private phaseSet = new Set<Phase>();
   /** Live upstream-call counter (SC-018). */
@@ -87,7 +99,7 @@ export class AgentLoop {
     this.sink = sink;
     this.opts = opts;
     this.ctxManager.setWindowSize(opts.context_window_size ?? 4096);
-    this.logger = createLogger('loop');
+    this.logger = opts.logger ?? createLogger('loop');
   }
 
   async run(
@@ -103,6 +115,13 @@ export class AgentLoop {
     let lastOutput = '';
     let pendingToolCalls: ToolCall[] = [];
     let round = 0;
+    const startedAt = Date.now();
+
+    this.logger.info(
+      `agent loop start: model=${o.model ?? 'auto'} max_rounds=${o.max_rounds} messages=${messages.length} ` +
+      `tools=${o.tools?.length ? o.tools.map((t) => t.function.name).join(',') : '-'} ` +
+      `tool_choice=${o.tool_choice ?? '-'} resume=${buildToolTranscript(messages).length > 0}`,
+    );
 
     // FASE 2: the internal loop phases (interpret/planify/evaluate) never see the structured
     // tool-exchange turns that travel on the wire (assistant tool_calls + tool results) — those
@@ -114,7 +133,17 @@ export class AgentLoop {
 
     for (; round < o.max_rounds; round++) {
       try {
-        if (this.sink?.isDisconnected()) break; // SC-023: abort before any upstream call
+        // SC-023: abort before any upstream call when the sink is already gone.
+        if (this.sink?.isDisconnected()) break;
+        // Stop propagation: an aborted request (the user cut the connection / asked the model to
+        // stop) halts the loop before any further upstream call; the in-flight call, if any, is
+        // cancelled through the same AbortSignal. Unlike a silent sink disconnect this is an
+        // explicit failure of the run, so it records decision='error'.
+        if (o.abort_signal?.aborted) {
+          if (decision === 'continue') decision = 'error';
+          this.logger.warn(`agent loop stopped: client aborted (round ${round + 1})`);
+          break;
+        }
 
         // ---- Interpret phase (SC-004): ask the model to interpret, surface structured reasoning. ----
         this.phaseSet.add('interpreting');
@@ -122,15 +151,23 @@ export class AgentLoop {
         // FASE 1: pass the sink as the live emitter so interpretation reasoning deltas reach the
         // client WHILE the upstream generates them. When the provider streamed, the full-text
         // fallback emit below would duplicate what already left on the wire — skip it then.
-        const interp = await interpretRequest(this.provider, [...internalMessages], () => '', { model: o.model }, this.sink);
+        const interpT0 = Date.now();
+        this.countCall('interpret');
+        const interp = await interpretRequest(this.provider, [...internalMessages], () => '', { model: o.model, logger: this.logger, traceId: o.traceId, abort_signal: o.abort_signal }, this.sink);
         if (this.sink && !interp.streamed) this.sink.emitReasoning(0, interp.reasoning || interp.interpretation.mainObjective);
+        this.logger.info(
+          `interpret (round ${round + 1}): ${Date.now() - interpT0}ms objective="${interp.interpretation.mainObjective.replace(/\s+/g, ' ').slice(0, 160)}" ` +
+          `sub_objectives=${interp.interpretation.subObjectives.length} resources=${interp.interpretation.resourcesNeeded.length}`,
+        );
 
         // ---- Initial task generation from the interpretation (SC-005). ----
         let tasks = await generateTasks(this.provider, originalInstruction, interp.interpretation);
 
         // ---- Planning / task selection. Consume pre-generated tasks in order, refine when out. ----
         this.emitPhase('planning', { step: 'planify' });
+        const planT0 = Date.now();
         const task = tasks[round] ?? await this.planify(nextGoalHint(originalInstruction, lastOutput));
+        this.logger.info(`plan (round ${round + 1}): ${Date.now() - planT0}ms task="${task.description.replace(/\s+/g, ' ').slice(0, 160)}"`);
         trace.push({ iteration: round + 1, phase: 'planning', task_id: task.id, content: task.description });
 
         // ---- Execute with auto-healing + doom-loop guard (SC-012/013/014). ----
@@ -143,11 +180,15 @@ export class AgentLoop {
 
           // The provider call options carry the delegated client tools (FASE 2); interpretation /
           // planning / evaluation never receive them.
-          const callOptions = { tools: o.tools, tool_choice: o.tool_choice };
+          const callOptions = { tools: o.tools, tool_choice: o.tool_choice, logger: this.logger, trace_id: o.traceId, abort_signal: o.abort_signal };
+
+          // Counted BEFORE the call: a failed upstream call is still an upstream call — the metric
+          // must reflect what left the proxy (the deterministic-error path threw before the old
+          // post-call count, so failures were invisible in `request done`).
+          this.countCall('execute');
 
           // No watcher, or a provider without completeStream (unit-test stubs): fully buffered call.
           if (!this.sink) {
-            this.countCall('execute');
             const res = await this.provider.complete(o.model, prompt, callOptions);
             return { output: res.content ?? '', reasoning: res.reasoning || '', doomedLoop: { detected: false, repetitions: 0 }, tool_calls: res.tool_calls };
           }
@@ -181,26 +222,46 @@ export class AgentLoop {
               if (doomed.detected) lastDoomed = doomed;
             },
           });
-          this.countCall('execute');
 
           return { output: (result.content ?? ''), reasoning: result.reasoning || '', doomedLoop: lastDoomed, tool_calls: result.tool_calls };
         };
 
         let outcome;
+        const execT0 = Date.now();
         try {
           outcome = await withAutoHealingRetry(executeStep, {
             maxRetries: o.max_retries,
             doomLoopThreshold: o.doom_loop_threshold,
+            abortSignal: o.abort_signal,
           });
         } catch (err) {
-          this.logger.error(`execute failed: ${String(err)}`);
+          if (isAbortError(err) || o.abort_signal?.aborted) {
+            this.logger.warn(`execute aborted (round ${round + 1}): ${Date.now() - execT0}ms — stopped per client request`);
+          } else {
+            this.logger.error(`execute failed (round ${round + 1}): ${Date.now() - execT0}ms: ${String(err)}`);
+          }
           decision = 'error';
           break;
         }
+        this.logger.info(
+          `execute (round ${round + 1}): ${Date.now() - execT0}ms status=${outcome.result.status} ` +
+          `output_len=${outcome.result.output.length} heal_retries=${outcome.traces.length} ` +
+          `doom_loop=${outcome.doomedLoop.detected}`,
+        );
 
         const result: TaskResult = outcome.result;
         if (result.status === 'failed') {
-          decision = 'refusal_exhausted';
+          const aborted =
+            o.abort_signal?.aborted === true ||
+            (result.error !== undefined && isAbortError({ message: result.error }));
+          if (aborted) {
+            // The client interrupted (disconnect or explicit stop): no refusal, no doom loop —
+            // just stop, and never retry an aborted upstream call.
+            this.logger.warn(`execute aborted (round ${round + 1}): stopped per client request (no retry)`);
+            decision = 'error';
+          } else {
+            decision = 'refusal_exhausted';
+          }
           trace.push({ iteration: round + 1, phase: 'error', content: result.error ?? 'step failed after retries' });
           break;
         }
@@ -211,6 +272,10 @@ export class AgentLoop {
         // re-sending the conversation — assistant tool_calls + tool results — on the same session.
         const delegatedCalls: ToolCall[] = outcome.tool_calls ?? [];
         if (delegatedCalls.length > 0) {
+          this.logger.info(
+            `delegating ${delegatedCalls.length} tool call(s) to client: ` +
+            delegatedCalls.map((c) => `${c.function.name}(${(c.function.arguments ?? '').replace(/\s+/g, ' ').slice(0, 120)})`).join('; ')
+        );
           this.sink?.emitToolCalls(delegatedCalls);
           decision = 'tool_calls_pending';
           pendingToolCalls = delegatedCalls;
@@ -242,8 +307,10 @@ export class AgentLoop {
         this.emitPhase('evaluating', { step: `evaluate #${round + 1}` });
         // FASE 1: stream the evaluator's reasoning live too; on the buffered path keep the previous
         // whole-text emit so no tracing is lost when the provider cannot stream.
-        const evalCall = await evaluateTask(this.provider, originalInstruction, this.accumulatedSummary(accumulatedSteps), result, { model: o.model }, this.sink);
+        const evalT0 = Date.now();
         this.countCall('evaluate');
+        const evalCall = await evaluateTask(this.provider, originalInstruction, this.accumulatedSummary(accumulatedSteps), result, { model: o.model, logger: this.logger, traceId: o.traceId, abort_signal: o.abort_signal }, this.sink);
+        this.logger.info(`evaluate (round ${round + 1}): ${Date.now() - evalT0}ms decision=${evalCall.decision}`);
         if (this.sink) {
           if (evalCall.streamed) {
             // The "why" already arrived as live deltas; only append the binary decision marker.
@@ -264,6 +331,7 @@ export class AgentLoop {
           const condensed = this.ctxManager.condense();
           trace.push({ iteration: round + 1, phase: 'executing_task', content: `context condensed -> ${condensed.summary.length} chars` });
           accumulatedSteps.splice(0, Math.max(0, accumulatedSteps.length - condensed.remainingSteps.length));
+          this.logger.info(`context condensed (round ${round + 1}): kept ${condensed.remainingSteps.length} steps, summary ${condensed.summary.length} chars`);
         }
 
         // ---- Replenish the task queue from a fresh interpretation when we run out. ----
@@ -273,7 +341,11 @@ export class AgentLoop {
         }
       } catch (err) {
         // Any upstream failure during interpretation, planning, execution or evaluation SC-014.
-        this.logger.error(`agent loop step failed: ${String(err)}`);
+        if (isAbortError(err) || o.abort_signal?.aborted) {
+          this.logger.warn(`agent loop aborted (round ${round + 1}): ${String(err)} — stopping per client request (no retry)`);
+        } else {
+          this.logger.error(`agent loop step failed (round ${round + 1}): ${String(err)}`);
+        }
         decision = 'error';
         break;
       }
@@ -285,6 +357,10 @@ export class AgentLoop {
     if (decision === 'continue' && !this.sink?.isDisconnected()) {
       decision = 'max_rounds_exceeded';
     }
+    this.logger.info(
+      `agent loop end: decision=${decision} rounds=${round + (decision === 'max_rounds_exceeded' ? 0 : 0)} ` +
+      `upstream_calls=${this.totalUpstreamCalls} output_len=${lastOutput.length} elapsed=${Date.now() - startedAt}ms`,
+    );
 
     const finalResult: FinalResultData = {
       final_output: lastOutput || '',
@@ -314,6 +390,8 @@ export class AgentLoop {
       model: this.opts.model ?? null,
       tools: this.opts.tools,
       tool_choice: this.opts.tool_choice,
+      traceId: this.opts.traceId,
+      abort_signal: this.opts.abort_signal,
     };
   }
 
@@ -379,7 +457,7 @@ export class AgentLoop {
       provider: this.provider,
       model: this.opts.model ?? null,
       messages: prompt,
-      options: {},
+      options: { logger: this.logger, trace_id: this.opts.traceId, abort_signal: this.opts.abort_signal },
       surfaceDelta: this.sink
         ? (chunk) => {
             const reasoning = typeof chunk.reasoning === 'string' ? chunk.reasoning : '';
