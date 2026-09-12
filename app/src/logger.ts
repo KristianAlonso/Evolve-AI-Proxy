@@ -80,9 +80,24 @@ function rotateIfNeeded(): void {
   }
 }
 
-function formatLine(l: Line): string {
-  const time = new Date().toISOString();
-  return `${time} [${l.level.toUpperCase()}] ${l.sid ?? '-'} ${l.trace ?? '-'} ${l.msg}`;
+/** Console color for a severity tag: error red, warn yellow, debug dim, info green. */
+function levelTagColor(level: Level): keyof typeof ANSI {
+  switch (level) {
+    case 'error': return 'red';
+    case 'warn': return 'yellow';
+    case 'debug': return 'dim';
+    default: return 'green'; // info
+  }
+}
+
+/**
+ * Render the `<time> [<LEVEL>] <sid> <trace> ` prefix. The LOG FILE always receives the
+ * plain variant; the CONSOLE mirror gets the severity tag colored so a long stream is
+ * scannable at a glance (colors are console-only and respect NO_COLOR/FORCE_COLOR).
+ */
+function linePrefix(l: Line, colored: boolean): string {
+  const tag = colored ? paint(`[${l.level.toUpperCase()}]`, levelTagColor(l.level)) : `[${l.level.toUpperCase()}]`;
+  return `${l.ts} ${tag} ${l.sid ?? '-'} ${l.trace ?? '-'} `;
 }
 
 /**
@@ -92,10 +107,10 @@ function formatLine(l: Line): string {
  * receives so one `grep <trace_id>` over the log file reconstructs a full request lifecycle.
  */
 export interface TraceLogger {
-  debug(msg: string): void;
-  info(msg: string): void;
-  warn(msg: string): void;
-  error(msg: string): void;
+  debug(msg: string, consoleLine?: string): void;
+  info(msg: string, consoleLine?: string): void;
+  warn(msg: string, consoleLine?: string): void;
+  error(msg: string, consoleLine?: string): void;
   /** Return a copy of this logger bound to the given trace id. */
   traced(traceId: string): TraceLogger;
   /**
@@ -112,10 +127,10 @@ export function createLogger(sessionId: string): TraceLogger {
 
 function makeLogger(sid: string, traceId: string | undefined): TraceLogger {
   return {
-    debug(msg: string): void { log('debug', sid, traceId, msg); },
-    info(msg: string): void { log('info', sid, traceId, msg); },
-    warn(msg: string): void { log('warn', sid, traceId, msg); },
-    error(msg: string): void { log('error', sid, traceId, msg); },
+    debug(msg: string, consoleLine?: string): void { log('debug', sid, traceId, msg, consoleLine); },
+    info(msg: string, consoleLine?: string): void { log('info', sid, traceId, msg, consoleLine); },
+    warn(msg: string, consoleLine?: string): void { log('warn', sid, traceId, msg, consoleLine); },
+    error(msg: string, consoleLine?: string): void { log('error', sid, traceId, msg, consoleLine); },
     traced(id: string): TraceLogger { return makeLogger(sid, id); },
     requestResult(fileMsg: string, consoleLine: string): void {
       log('info', sid, traceId, fileMsg, consoleLine);
@@ -133,19 +148,19 @@ function log(
   sid: string | undefined,
   traceId: string | undefined,
   msg: string,
-  /** Optional pre-rendered console line (ANSI colors allowed). The file always gets the plain line. */
+  /** Optional pre-rendered console body (ANSI colors allowed). The file always gets the plain line. */
   consoleLine?: string,
 ): void {
-  const line = formatLine({ ts: new Date().toISOString(), level, sid, trace: traceId, msg });
+  const l: Line = { ts: new Date().toISOString(), level, sid, trace: traceId, msg };
+  // The log FILE always receives the plain line (no ANSI, ever).
+  const fileLine = linePrefix(l, false) + msg;
   if (env.CONSOLE_LOG) {
     // Live visibility: mirror every line to the console (errors/warnings to stderr, the rest
-    // to stdout) so incoming connections and their trace ids are visible without tailing the file.
-    // When a dedicated console rendering is given (e.g. colorized status), it replaces the
-    // plain line ONLY on the console — the file keeps the plain one.
+    // to stdout) with a colorized severity tag so incoming connections and their trace ids
+    // are visible without tailing the file. When a dedicated console rendering is given
+    // (e.g. colorized status/method), it replaces the plain body ONLY on the console.
     try {
-      // A dedicated console rendering (e.g. colorized status) replaces the plain body but keeps
-      // the standard `<time> [<LEVEL>] <sid> <trace>` prefix so console and file stay aligned.
-      const consoleOut = consoleLine !== undefined ? line.slice(0, line.length - msg.length) + consoleLine : line;
+      const consoleOut = linePrefix(l, true) + (consoleLine ?? msg);
       (level === 'error' || level === 'warn' ? process.stderr : process.stdout).write(consoleOut + '\n');
     } catch {
       /* console is best-effort */
@@ -153,7 +168,7 @@ function log(
   }
   try {
     mkdirSync(env.LOG_DIR, { recursive: true });
-    appendFileSync(currentFile(), line + '\n');
+    appendFileSync(currentFile(), fileLine + '\n');
     rotateIfNeeded();
   } catch {
     /* logging must never crash a request */

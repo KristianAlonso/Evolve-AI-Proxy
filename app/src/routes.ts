@@ -194,9 +194,11 @@ export async function createApp(options: CreateAppOptions = {}): Promise<Fastify
       traceId,
     };
     const endpoint = request.routeOptions?.url ?? request.url;
-    logger.traced(traceId).info(
-      `incoming: ${request.ip} ${request.method} ${endpoint} (HTTP/${request.raw.httpVersion})`,
-    );
+    const plainIncoming = `incoming: ${request.ip} ${request.method} ${endpoint} (HTTP/${request.raw.httpVersion})`;
+    // Console gets the colorized rendering (method magenta, endpoint cyan — same scheme as the
+    // result line); the file keeps the plain one.
+    const coloredIncoming = `incoming: ${request.ip} ${paint(request.method, 'magenta')} ${paint(endpoint, 'cyan')} (HTTP/${request.raw.httpVersion})`;
+    logger.traced(traceId).info(plainIncoming, coloredIncoming);
   });
 
   // ---- Live colored request-result line (console only; the file keeps its plain audit lines). ----

@@ -5,6 +5,7 @@
 import './env.js';
 import { createApp } from './routes.js';
 import env from './config.js';
+import { paint } from './logger.js';
 import type { ChatProvider } from './provider/types.js';
 import { OpenAICompatibleProvider } from './provider/openai-compatible-provider.js';
 
@@ -28,18 +29,21 @@ export async function main(provider?: ChatProvider): Promise<void> {
       // loudly instead: the user must stop the other instance (usually a stale background
       // dev proxy) and start again.
       console.error(
-        `fatal: port ${env.HTTP_PORT} is already in use by another process. That instance is ` +
-        `the one serving requests, so this console will NOT show incoming-connection logs. ` +
-        `Stop the other process first, e.g. in PowerShell:\n` +
-        `  Get-NetTCPConnection -LocalPort ${env.HTTP_PORT} -State Listen | ` +
-        `  Select-Object -ExpandProperty OwningProcess -Unique | ForEach-Object { Stop-Process -Id $_ -Force }`,
+        paint(
+          `fatal: port ${env.HTTP_PORT} is already in use by another process. That instance is ` +
+          `the one serving requests, so this console will NOT show incoming-connection logs. ` +
+          `Stop the other process first, e.g. in PowerShell:\n` +
+          `  Get-NetTCPConnection -LocalPort ${env.HTTP_PORT} -State Listen | ` +
+          `  Select-Object -ExpandProperty OwningProcess -Unique | ForEach-Object { Stop-Process -Id $_ -Force }`,
+          'red',
+        ),
       );
       process.exit(1);
     }
     throw err;
   }
 
-  console.log(`evolve_ai_proxy listening on http://${env.HTTP_HOST}:${env.HTTP_PORT}`);
+  console.log(paint(`evolve_ai_proxy listening on http://${env.HTTP_HOST}:${env.HTTP_PORT}`, 'green'));
 }
 
 // Guard: run() only when executed directly, not on import (`require.main === module` for CJS,
