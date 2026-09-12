@@ -21,11 +21,11 @@ La decisión (FASE 6) es convertir las tres fases no-iniciales (planificar / eje
 
 | Componente | Descripción | Ubicación |
 |------------|-------------|-----------|
-| **Fase de mapeo** | Antes de delegar, un único (máx. 2) upstream call le pregunta al modelo *su propia* herramienta de spawn entre las `tools` del cliente, y cuáles de sus argumentos portan title/type/prompt. Formato compacto de tools (nombre + descripción ≤300 chars + argumentos con enums), `max_tokens: 8192` (los modelos de razonamiento gastan el presupuesto en thinking). | `src/core/subagent-mapper.ts` |
+| **Fase de mapeo** | Antes de delegar, un único (máx. 2) upstream call le pregunta al modelo *su propia* herramienta de spawn entre las `tools` del cliente, qué argumentos portan title/type/prompt, y **listar TODOS los tipos de subagente** que esa herramienta puede lanzar (id + descripción, del más genérico al más especializado). El modelo elige **UN solo tipo** (el de propósito general; si no existe, el más apropiado para todas las fases) y ese tipo es **validado como existente**: debe estar en su propia lista, y cuando el argumento type tiene un `enum` real en el schema del cliente, todos los ids listados deben estar en ese enum. Formato compacto de tools (nombre + descripción ≤300 chars + argumentos con enums), `max_tokens: 8192` (los modelos de razonamiento gastan el presupuesto en thinking). | `src/core/subagent-mapper.ts` |
 | **Envelope de spawn** | Prompt del tool call: línea 1 = JSON `{"phase","parent_session_id","agent_id"}`, línea 2 vacía, línea 3+ = descripción de la tarea. `agent_id` **nunca** viaja como argumento del tool call — solo dentro del envelope (evita depender del schema del tool del cliente). | `src/core/subagent-spawn.ts` |
 | **Orquestador** | Máquina de estados `planify → execute → evaluate → [siguiente ronda] | done`, serializable en `LoopStateData` (vive en la sesión del padre en `SessionStore`, TTL 30 min). `start()` = mapeo + interpret + spawn(planify). `resume()` = consume el resultado de la fase y emite el siguiente spawn o la respuesta final (**sincrónico**, sin upstream call). `runSubagentPhase()` = ejecuta UNA fase para la primera petición del subagente. | `src/core/orchestrator.ts` |
 | **Tri-partición en routes** | (1) El prompt lleva un envelope → es un subagente (primera petición = correr la fase; continuaciones = petición normal, su último contenido actualiza el resultado de la fase — *last content wins*). (2) La sesión propia lleva `loopState` → parent resume. (3) Petición nueva con tools + `x-session-id` y sin sesión guardada → `orchestrator.start()`. Si el mapeo falla (`null`) → **fall-through al bucle inline clásico** (comportamiento FASE 2/3 intacto). | `src/routes.ts` |
-| **Endurecimiento (live run)** | En `resume()`, si el resultado de la fase pendiente **aún no llegó** (el cliente bloqueó o no ejecutó el subagente), el proxy **re-emite el mismo spawn** (mismo `agent_id`) sin consumir el estado: las rondas solo avanzan con un resultado real, de modo que un subagente bloqueado nunca hace girar el bucle con salidas vacías. | `src/core/orchestrator.ts` |
+| **Endurecimiento (live run)** | En `resume()`, si el resultado de la fase pendiente **aún no llegó** (el cliente bloqueó o no ejecutó el subagente), el proxy **re-emite el mismo spawn** (mismo `agent_id`) sin consumir el estado: las rondas solo avanzan con un resultado real, de modo que un subagente bloqueado nunca hace girar el bucle con salidas vacías. **Failover de tipo:** tras `SPAWN_RETRY_THRESHOLD` (3) re-emisiones sin resultado, el orquestador rota al **siguiente tipo disponible** (el mapeo guarda todos los tipos) y re-dispara con un `agent_id` nuevo. El tipo que por fin produce un resultado queda **fijado para el resto de la sesión**. Sin candidatos más, se queda re-emitiendo de forma estable. | `src/core/orchestrator.ts` |
 
 ### Formato de resultado canónico
 
@@ -55,7 +55,7 @@ El resultado de una fase es el **último** `content` del subagente (no el primer
 
 ### Positivas
 
-- El cliente **ve y controla** cada fase (títulos `planify (round N)` / `execute (round N)` / `evaluate (round N)` con el tipo de subagente que elige el modelo, p. ej. `explorer` / `coder` / `reviewer`).
+- El cliente **ve y controla** cada fase (títulos `planify (round N)` / `execute (round N)` / `evaluate (round N)`). **Un único tipo de subagente** (el de propósito general) se usa para todas las fases; si falla, **failover secuencial** por los tipos disponibles (los que el mapeo enumeró) hasta encontrar uno que funcione, que queda **fijado** para la sesión. El tipo elegido siempre existe (validado contra la lista del propio modelo y contra el `enum` real del schema cuando hay).
 - Cada fase es una petición HTTP corta → sin conexiones de varios minutos, timeouts amables.
 - Estado serializable → auditable y recuperable dentro del TTL.
 - **Fail-safe total:** sin herramienta de spawn, o con un modelo incapaz de mapearla, la petición degrada al bucle inline clásico. Ninguna petición se rompe.
@@ -65,7 +65,8 @@ El resultado de una fase es el **último** `content` del subagente (no el primer
 
 | Riesgo | Mitigación |
 |--------|-----------|
-| La herramienta de spawn del cliente puede tener contratos extra (p. ej. el plugin `opencode-swarm` exige un campo `ACCEPTANCE:` en el prompt de delegación) y bloquear el dispatch | Comportamiento cliente-side; el proxy re-emite el mismo spawn de forma estable (endurecimiento) y la sesión caduca por TTL. La degradación al bucle inline sigue disponible. |
+| La herramienta de spawn del cliente puede tener contratos extra (p. ej. el plugin `opencode-swarm` exige un campo `ACCEPTANCE:` en el prompt de delegación) y bloquear el dispatch | Comportamiento cliente-side; el proxy re-emite el mismo spawn de forma estable (endurecimiento), rota de tipo al fallar (failover) y la sesión caduca por TTL. La degradación al bucle inline sigue disponible. |
+| El modelo inventa un tipo de subagente que el cliente no reconoce | Doble validación: `type_id` debe existir en la lista que el propio modelo enumeró (`parseSpawnSpec`), y todos los ids deben estar en el `enum` real del argumento type cuando el schema lo lleva (mapper). Con string libre, el prompt prefiere el tipo más genérico. |
 | El modelo local puede ser incapaz de mapear la herramienta (presupuesto de salida en thinking) | `max_tokens: 8192` + prompt compacto (verificado live: mapeo exitoso en el primer intento con `llama_cpp/default`); si aún falla → inline |
 | Cuerpos de conversación que crecen entre peticiones pueden exceder límites de tamaño del upstream (se observó `Payload Too Large` en un run live) | Fuera de alcance del contrato de delegación; el contexto de las fases ya está limitado por diseño (`max_rounds`, bullets truncados) |
 | Complejidad de `routes.ts` (3 ramas + helpers) | Helpers separados (`handleSubagentPhase`, `recordSubagentResult`, `toFinalResult`) y tests unitarios del orquestador/mapeo/spawn |
@@ -74,7 +75,7 @@ El resultado de una fase es el **último** `content` del subagente (no el primer
 
 Con `opencode` (218 tools, `opencode-swarm`) contra `llama_cpp/default`:
 
-1. Mapeo exitoso en el primer intento: `tool="task" args={title:description,type:subagent_type,prompt:prompt} phase_types={planify:explorer,execute:coder,evaluate:reviewer}`.
+1. Mapeo exitoso en el primer intento con un único tipo: `tool="task" args={title:description,type:subagent_type,prompt:prompt} type="default" available=[default]` — el cliente (opencode-swarm) acepta el tipo y muestra **Default Agent** en el dispatch. (Evolución: antes, `phase_types={planify:explorer,execute:coder,evaluate:reviewer}` por fase; después, `type="task"` general; ahora, un solo tipo validado + lista de failover.)
 2. `start()` emite `spawn` de `planify (round 1)`; cada petición de parent-resume emite el siguiente spawn (`execute`, `evaluate`, `planify (round 2)`…), cada una en ~10 ms y 3 SSE frames.
 3. Los subagentes se mostraron en el cliente con título y tipo (`planify (round 5) — Explorer Agent`), confirmando R2/R3 en el wire OpenAI estándar.
 4. Con el plugin bloqueando los dispatches (contrato `ACCEPTANCE`), se activó el endurecimiento: re-emisión estable del mismo spawn sin avanzar rondas.

@@ -27,6 +27,14 @@ export interface LoopStateData {
   tool_choice?: ToolChoice;
   /** The mapped shape of the client's subagent-spawn tool (null = mapping failed -> inline loop). */
   spec: SubagentSpawnSpec | null;
+  /**
+   * The single subagent type currently in use for this session (set from `spec.typeId` at start;
+   * rotated to the next `spec.availableTypes` entry when the active type keeps failing, and pinned
+   * for the rest of the session once it yields a phase result).
+   */
+  activeTypeId: string;
+  /** Consecutive spawn re-emissions of the pending phase without a result (failover counter). */
+  spawnRetries: number;
   interpretation: Interpretation | null;
   /** The current AgentTask for the round (set after the planify phase result is consumed). */
   task: AgentTask | null;
@@ -59,6 +67,8 @@ export function newLoopState(args: {
     tools: args.tools,
     tool_choice: args.tool_choice,
     spec: args.spec,
+    activeTypeId: args.spec?.typeId ?? '',
+    spawnRetries: 0,
     interpretation: null,
     task: null,
     lastOutput: '',

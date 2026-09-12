@@ -25,19 +25,34 @@ export interface SpawnEnvelope {
   agent_id: string;
 }
 
+export interface SubagentTypeOption {
+  id: string;
+  description: string;
+}
+
 /**
  * The class that determines the shape of the client's subagent-spawn tool (FASE 6 mapping phase):
- * which tool to call and which argument names carry the title / type / prompt. `agent_id` is
- * deliberately NOT part of the mapping — it never travels as a tool argument.
+ * which tool to call, which argument names carry the title / type / prompt, and the pool of
+ * subagent types the client tool can launch. `agent_id` is deliberately NOT part of the mapping —
+ * it never travels as a tool argument.
  */
 export interface SubagentSpawnSpec {
   /** The client tool that creates a subagent (must exist in the tools the client sent). */
   toolName: string;
   /** Argument names (per the tool's own schema) for each spawn parameter. */
   argMapping: { title: string; type: string; prompt: string };
-  /** The subagent type id the model chose for each phase (FASE 6: "el tipo lo determina el
-   *  modelo en la fase de mapeo"). */
-  phaseTypes: Record<string, string>;
+  /**
+   * Every subagent type the client tool can launch (ordered most general-purpose first). Used for
+   * failover: when the active type never yields a phase result, the orchestrator rotates to the
+   * next available one.
+   */
+  availableTypes: SubagentTypeOption[];
+  /**
+   * The single subagent type used for EVERY delegated phase. Validated to exist in
+   * `availableTypes` (the model may only pick types that actually exist). Sticky for the session;
+   * rotated by the orchestrator only on failure.
+   */
+  typeId: string;
 }
 
 /** Mint a proxy-side agent id (travelled only inside the envelope prompt). */
@@ -112,13 +127,14 @@ export function buildSpawnToolCall(
   envelope: SpawnEnvelope,
   taskDescription: string,
   title?: string,
+  typeId?: string,
 ): ToolCall {
   if (!spec.argMapping || !spec.argMapping.title || !spec.argMapping.type || !spec.argMapping.prompt) {
     throw new Error('SubagentSpawnSpec.argMapping is incomplete — cannot build the spawn tool call');
   }
   const args: Record<string, unknown> = {
     [spec.argMapping.title]: title ?? envelope.phase,
-    [spec.argMapping.type]: spec.phaseTypes[envelope.phase] ?? 'default',
+    [spec.argMapping.type]: typeId ?? spec.typeId,
     [spec.argMapping.prompt]: buildSpawnPrompt(envelope, taskDescription),
   };
   return {
@@ -155,12 +171,30 @@ export function parseSpawnSpec(
     typeof mapping.prompt !== 'string' || mapping.prompt === ''
   ) return null;
 
-  const phaseTypes: Record<string, string> = {};
-  for (const phase of DELEGATED_PHASES) {
-    const types = parsed.phase_types as Record<string, unknown> | undefined;
-    const t = types?.[phase];
-    phaseTypes[phase] = typeof t === 'string' && t !== '' ? t : 'default';
+  // Every subagent type the tool can launch (failover candidates), ordered most general-purpose
+  // first. At least one is mandatory; duplicate ids are collapsed (first one wins).
+  const rawTypes = Array.isArray(parsed.subagent_types) ? parsed.subagent_types : null;
+  if (!rawTypes || rawTypes.length === 0) return null;
+  const availableTypes: SubagentTypeOption[] = [];
+  const seen = new Set<string>();
+  for (const entry of rawTypes) {
+    if (!entry || typeof entry !== 'object') return null;
+    const id = (entry as { id?: unknown }).id;
+    if (typeof id !== 'string' || id.trim() === '') return null;
+    if (seen.has(id.trim())) continue;
+    seen.add(id.trim());
+    const description = (entry as { description?: unknown }).description;
+    availableTypes.push({ id: id.trim(), description: typeof description === 'string' ? description : '' });
   }
 
-  return { toolName, argMapping: { title: mapping.title, type: mapping.type, prompt: mapping.prompt }, phaseTypes };
+  // HARD CONSTRAINT: the chosen type MUST exist in the available list.
+  const typeId = typeof parsed.type_id === 'string' ? (parsed.type_id as string).trim() : '';
+  if (!availableTypes.some((t) => t.id === typeId)) return null;
+
+  return {
+    toolName,
+    argMapping: { title: mapping.title, type: mapping.type, prompt: mapping.prompt },
+    availableTypes,
+    typeId,
+  };
 }

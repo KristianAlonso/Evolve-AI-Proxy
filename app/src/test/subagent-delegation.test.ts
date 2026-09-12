@@ -17,7 +17,7 @@ import {
   type SubagentSpawnSpec,
 } from '../core/subagent-spawn.js';
 import { mapSubagentTool } from '../core/subagent-mapper.js';
-import { SubagentOrchestrator, type OrchestratorOutcome } from '../core/orchestrator.js';
+import { SPAWN_RETRY_THRESHOLD, SubagentOrchestrator, type OrchestratorOutcome } from '../core/orchestrator.js';
 import { newLoopState, type LoopStateData } from '../core/loop-state.js';
 import { stub } from './stub-provider.js';
 
@@ -26,7 +26,12 @@ const log: TraceLogger = createLogger('test');
 const VALID_SPEC_JSON = JSON.stringify({
   tool_name: 'task',
   arg_mapping: { title: 'description', type: 'subagent_type', prompt: 'prompt' },
-  phase_types: { planify: 'plan', execute: 'build', evaluate: 'critic' },
+  subagent_types: [
+    { id: 'plan', description: 'Plans work' },
+    { id: 'build', description: 'Builds things' },
+    { id: 'critic', description: 'Evaluates results' },
+  ],
+  type_id: 'plan',
 });
 
 const SPAWN_TOOL: ToolDefinition = {
@@ -111,7 +116,8 @@ describe('subagent spawn contract', () => {
     const spec: SubagentSpawnSpec = {
       toolName: 'task',
       argMapping: { title: 'description', type: 'subagent_type', prompt: 'prompt' },
-      phaseTypes: { planify: 'plan', execute: 'build', evaluate: 'critic' },
+      availableTypes: [{ id: 'plan', description: 'Plans work' }],
+      typeId: 'plan',
     };
     const call = buildSpawnToolCall(spec, envelope, 'Plan the next task.', 'planify (round 1)');
     expect(call.id).toBe('spawn_agent-abc123');
@@ -119,7 +125,10 @@ describe('subagent spawn contract', () => {
     const args = JSON.parse(call.function.arguments) as Record<string, unknown>;
     expect(Object.keys(args).sort()).toEqual(['description', 'prompt', 'subagent_type'].sort());
     expect(args.description).toBe('planify (round 1)');
-    expect(args.subagent_type).toBe('plan');
+    expect(args.subagent_type).toBe('plan'); // the single active type (spec.typeId)
+    // An explicit type override (failover) wins over spec.typeId.
+    const rotated = buildSpawnToolCall(spec, envelope, 'Plan the next task.', 'planify (round 1)', 'build');
+    expect(JSON.parse(rotated.function.arguments).subagent_type).toBe('build');
     // The envelope (with agent_id) is embedded in the prompt text...
     const promptArg = String(args.prompt);
     expect(JSON.parse(promptArg.split('\n', 1)[0])).toEqual(envelope);
@@ -131,7 +140,8 @@ describe('subagent spawn contract', () => {
     const spec = parseSpawnSpec(VALID_SPEC_JSON, ['task', 'read_file']);
     expect(spec).not.toBeNull();
     expect(spec!.toolName).toBe('task');
-    expect(spec!.phaseTypes.execute).toBe('build');
+    expect(spec!.typeId).toBe('plan');
+    expect(spec!.availableTypes.map((t) => t.id)).toEqual(['plan', 'build', 'critic']);
 
     expect(parseSpawnSpec('{"none":true}', ['task'])).toBeNull();
     expect(parseSpawnSpec(VALID_SPEC_JSON, ['read_file'])).toBeNull(); // tool not offered by the client
@@ -139,12 +149,16 @@ describe('subagent spawn contract', () => {
     expect(parseSpawnSpec('```json\n' + VALID_SPEC_JSON + '\n```', ['task'])).not.toBeNull(); // markdown-tolerant
     // missing arg_mapping field -> null
     expect(
-      parseSpawnSpec('{"tool_name":"task","arg_mapping":{"title":"a","type":"b"},"phase_types":{}}', ['task']),
+      parseSpawnSpec('{"tool_name":"task","arg_mapping":{"title":"a","type":"b"},"subagent_types":[{"id":"x"}],"type_id":"x"}', ['task']),
     ).toBeNull();
-    // missing phase_types -> defaults to 'default'
-    const minimal = parseSpawnSpec('{"tool_name":"task","arg_mapping":{"title":"a","type":"b","prompt":"c"}}', ['task']);
-    expect(minimal).not.toBeNull();
-    expect(minimal!.phaseTypes.planify).toBe('default');
+    // missing subagent_types -> null
+    expect(parseSpawnSpec('{"tool_name":"task","arg_mapping":{"title":"a","type":"b","prompt":"c"},"type_id":"a"}', ['task'])).toBeNull();
+    // empty subagent_types -> null
+    expect(parseSpawnSpec('{"tool_name":"task","arg_mapping":{"title":"a","type":"b","prompt":"c"},"subagent_types":[],"type_id":"a"}', ['task'])).toBeNull();
+    // type_id NOT in the available list -> null (the chosen agent must exist)
+    expect(
+      parseSpawnSpec('{"tool_name":"task","arg_mapping":{"title":"a","type":"b","prompt":"c"},"subagent_types":[{"id":"x"}],"type_id":"y"}', ['task']),
+    ).toBeNull();
   });
 
   it('newAgentId is unique-ish and prefixed', () => {
@@ -168,9 +182,23 @@ describe('subagent tool mapper', () => {
     const spec = await mapSubagentTool(provider, [SPAWN_TOOL, OTHER_TOOL], { model: 'm', logger: log });
     expect(spec).not.toBeNull();
     expect(spec!.toolName).toBe('task');
+    expect(spec!.typeId).toBe('plan');
+    expect(spec!.availableTypes.map((t) => t.id)).toEqual(['plan', 'build', 'critic']);
     // The mapping prompt must have seen both tool names (so the model can pick).
     const mappingCall = provider.calls.find((c) => c.messages.some((m) => (m.content ?? '').includes('tool mapper')));
     expect(mappingCall).toBeDefined();
+  });
+
+  it('rejects (after retries) a spec whose type ids are not in the client tool type-enum (must exist)', async () => {
+    const bogus = JSON.stringify({
+      tool_name: 'task',
+      arg_mapping: { title: 'description', type: 'subagent_type', prompt: 'prompt' },
+      subagent_types: [{ id: 'fancy', description: 'not a real type' }],
+      type_id: 'fancy',
+    });
+    const provider = withMapping(stub(), bogus);
+    expect(await mapSubagentTool(provider, [SPAWN_TOOL], { model: 'm', logger: log })).toBeNull();
+    expect(provider.calls.length).toBe(2); // both attempts rejected
   });
 
   it('returns null after retries when the model answers {"none":true} or garbage', async () => {
@@ -211,8 +239,14 @@ function makeState(overrides: Partial<LoopStateData> = {}): LoopStateData {
   state.spec = {
     toolName: 'task',
     argMapping: { title: 'description', type: 'subagent_type', prompt: 'prompt' },
-    phaseTypes: { planify: 'plan', execute: 'build', evaluate: 'critic' },
+    availableTypes: [
+      { id: 'plan', description: 'Plans work' },
+      { id: 'build', description: 'Builds things' },
+      { id: 'critic', description: 'Evaluates results' },
+    ],
+    typeId: 'plan',
   };
+  state.activeTypeId = state.spec.typeId; // start() normally does this after the mapping
   return { ...state, ...overrides };
 }
 
@@ -244,6 +278,7 @@ describe('subagent orchestrator', () => {
     expect(state.pendingAgentId).toBe(env.agent_id);
     expect(state.stage).toBe('planify');
     expect(state.spec).not.toBeNull();
+    expect(state.activeTypeId).toBe('plan'); // pinned from spec.typeId at start
     expect(sinkCreated).toBe(true);
     expect(state.totalUpstreamCalls).toBe(2); // mapping + interpret
   });
@@ -277,7 +312,8 @@ describe('subagent orchestrator', () => {
     const out1 = orchestrator.resume(state, 'ses_parent_1');
     expect(out1.kind).toBe('tool_call');
     expect(out1.toolCall!.id).toBe(`spawn_${state.pendingAgentId}`);
-    expect(JSON.parse(out1.toolCall!.function.arguments).subagent_type).toBe('build');
+    // The SAME single type is used for every phase (state.activeTypeId = spec.typeId).
+    expect(JSON.parse(out1.toolCall!.function.arguments).subagent_type).toBe('plan');
     expect(state.stage).toBe('execute');
     expect(state.task!.description).toBe('Take a concrete step');
 
@@ -342,6 +378,58 @@ describe('subagent orchestrator', () => {
     expect(third.kind).toBe('tool_call');
     expect(state.stage).toBe('execute');
     expect(state.task!.description).toBe('A real step');
+  });
+
+  it('resume(): after SPAWN_RETRY_THRESHOLD re-emits without a result, rotates to the NEXT type with a fresh agent id (failover)', () => {
+    const orchestrator = new SubagentOrchestrator(stub(), log);
+    const state = makeState();
+    state.pendingAgentId = 'agent-a';
+    expect(state.activeTypeId).toBe('plan');
+
+    // Re-emits BEFORE the threshold: same type, same agent id, stage/round untouched.
+    for (let i = 1; i < SPAWN_RETRY_THRESHOLD; i++) {
+      const out = orchestrator.resume(state, 'ses_parent_1');
+      expect(out.kind).toBe('tool_call');
+      expect(out.toolCall!.id).toBe('spawn_agent-a');
+      expect(JSON.parse(out.toolCall!.function.arguments).subagent_type).toBe('plan');
+    }
+    expect(state.activeTypeId).toBe('plan');
+    expect(state.stage).toBe('planify');
+
+    // Resume #SPAWN_RETRY_THRESHOLD: failover to the next available type, FRESH agent id.
+    const rotated = orchestrator.resume(state, 'ses_parent_1');
+    expect(state.activeTypeId).toBe('build');
+    expect(rotated.kind).toBe('tool_call');
+    expect(state.pendingAgentId).not.toBe('agent-a');
+    expect(rotated.toolCall!.id).toBe(`spawn_${state.pendingAgentId}`);
+    expect(JSON.parse(rotated.toolCall!.function.arguments).subagent_type).toBe('build');
+    expect(state.spawnRetries).toBe(0);
+
+    // Walking the list again reaches the LAST type — after it, rotation stops (no candidates left)
+    // and re-emission stays stable on the same agent id.
+    for (let i = 0; i < SPAWN_RETRY_THRESHOLD - 1; i++) orchestrator.resume(state, 'ses_parent_1');
+    orchestrator.resume(state, 'ses_parent_1');
+    expect(state.activeTypeId).toBe('critic');
+    const idAtLast = state.pendingAgentId!;
+    const stuck = orchestrator.resume(state, 'ses_parent_1');
+    expect(state.activeTypeId).toBe('critic');
+    expect(stuck.toolCall!.id).toBe(`spawn_${idAtLast}`);
+  });
+
+  it('resume(): a real phase result resets the retry counter and pins the current type', () => {
+    const orchestrator = new SubagentOrchestrator(stub(), log);
+    const state = makeState();
+    state.pendingAgentId = 'agent-a';
+    state.activeTypeId = 'build'; // pretend we already failed over once
+    state.spawnRetries = SPAWN_RETRY_THRESHOLD - 1; // one re-emit away from rotation
+
+    // The result arrives BEFORE the next resume: no rotation, counter reset, type pinned.
+    state.phaseResults['agent-a'] = JSON.stringify({ description: 'A real step' });
+    const out = orchestrator.resume(state, 'ses_parent_1');
+    expect(out.kind).toBe('tool_call');
+    expect(state.activeTypeId).toBe('build'); // pinned — kept for the rest of the session
+    expect(state.spawnRetries).toBe(0);
+    expect(state.stage).toBe('execute');
   });
 
   it('resume(): max_rounds exceeded ends with decision max_rounds_exceeded', () => {

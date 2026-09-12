@@ -1,7 +1,10 @@
 // FASE 6 — subagent tool mapping: at the start of the first request (the parent's), the proxy asks
-// the model WHICH client tool creates subagents and how its arguments map to (title, type, prompt).
-// The model also picks the subagent TYPE for each delegated phase. The result is a
-// SubagentSpawnSpec used to emit the spawn ToolCall before every phase.
+// the model WHICH client tool creates subagents, how its arguments map to (title, type, prompt),
+// and to list EVERY subagent type that tool can launch (id + description, most general first).
+// The model then picks ONE general-purpose type (it MUST exist in its own list; when the type
+// argument has a real enum in the client schema, every listed id is hard-validated against it).
+// The result is a SubagentSpawnSpec: the orchestrator uses spec.typeId for every spawn and walks
+// spec.availableTypes as failover candidates when the active type never yields a phase result.
 //
 // Fail-safe (never breaks the request): no client tools -> null without any upstream call; a
 // malformed mapping answer or a tool name that does not exist in the client's tools -> null after
@@ -10,9 +13,24 @@
 import type { ChatProvider } from '../provider/types.js';
 import type { ToolChoice, ToolDefinition, UpstreamMessage } from '../types.js';
 import type { TraceLogger } from '../logger.js';
-import { DELEGATED_PHASES, parseSpawnSpec, type SubagentSpawnSpec } from './subagent-spawn.js';
+import { parseSpawnSpec, type SubagentSpawnSpec } from './subagent-spawn.js';
 
 const MAX_ATTEMPTS = 2;
+
+/**
+ * HARD existence check: when the mapped type argument has a real `enum` in the client tool's
+ * schema, every id listed in the spec (and therefore the chosen one too) MUST be one of those
+ * enum values — the model can never invent a subagent type. Returns false when the spec names a
+ * type the client tool cannot actually launch.
+ */
+function specTypesExistInClient(spec: SubagentSpawnSpec, clientTools: ToolDefinition[]): boolean {
+  const tool = clientTools.find((t) => t.function.name === spec.toolName);
+  const params = tool?.function.parameters as { properties?: Record<string, { enum?: string[] }> } | undefined;
+  const enumVals = params?.properties?.[spec.argMapping.type]?.enum;
+  if (!Array.isArray(enumVals) || enumVals.length === 0) return true; // free-form: trust the model's list
+  const allowed = enumVals.map((v) => String(v));
+  return spec.availableTypes.every((t) => allowed.includes(t.id));
+}
 
 export interface MapSubagentToolOptions {
   model: string | null;
@@ -35,9 +53,21 @@ export async function mapSubagentTool(
     'The client offers the function tools listed below (compact JSON: name, description, and argument names; some arguments list their allowed values in [enum: ...]). One of them creates subagents —',
     'it may be called spawn, subagent, task, agent, delegate or similar — and takes at least a',
     'title, a subagent type, and a prompt/instruction.',
+    'Identify that tool, map its arguments, and list ALL the subagent types it can launch: every',
+    'type id together with a one-line description, ordered from the MOST general/simple/all-purpose',
+    'type to the most specialized ones.',
+    'When the subagent type argument has an [enum: ...] list, the ids in "subagent_types" MUST all',
+    'come from that list (include every value it offers). When it has no enum, list the type ids',
+    'that the tool or argument description mentions; if you cannot establish any, list exactly one',
+    'entry: {"id":"default","description":"default"}.',
+    'Then pick ONE subagent type to be used for EVERY delegated phase: the most general, simple,',
+    'all-purpose type available (a generic "task"/"general"/"default"/"plain"/"standard" type). Do',
+    'NOT pick a specialized or role-specific agent type (coder, reviewer, planner, researcher,',
+    'explorer, critic, ...) unless no general-purpose type exists; in that case pick the single most',
+    'appropriate type to handle planning, execution and evaluation alike. The chosen type MUST be',
+    'one of the ids you listed in "subagent_types".',
     'Do NOT explain or reason in your output. Reply with ONLY the JSON object (no prose, no markdown) of EXACTLY this shape:',
-    '{"tool_name":"<the subagent-creating tool>","arg_mapping":{"title":"<argument name for the subagent title>","type":"<argument name for the subagent type>","prompt":"<argument name for the subagent prompt/instruction>"},"phase_types":{"planify":"<subagent type id to use for planning tasks>","execute":"<subagent type id to use for execution tasks>","evaluate":"<subagent type id to use for evaluation tasks>"}}',
-    'Use subagent type ids that actually appear in the tool argument [enum: ...] lists when present.',
+    '{"tool_name":"<the subagent-creating tool>","arg_mapping":{"title":"<argument name for the subagent title>","type":"<argument name for the subagent type>","prompt":"<argument name for the subagent prompt/instruction>"},"subagent_types":[{"id":"<type id>","description":"<one line>"}],"type_id":"<the one chosen type id>"}',
     'If NO tool creates subagents, reply with exactly: {"none":true}',
   ].join('\n');
 
@@ -74,11 +104,17 @@ export async function mapSubagentTool(
         trace_id: options.traceId,
         abort_signal: options.abort_signal,
       });
-      const spec = parseSpawnSpec(result.content ?? '', names);
+      let spec = parseSpawnSpec(result.content ?? '', names);
+      if (spec && !specTypesExistInClient(spec, clientTools)) {
+        options.logger?.warn(
+          `subagent mapping attempt ${attempt}: rejected — mapped subagent types are not in the client tool's type enum`,
+        );
+        spec = null;
+      }
       if (spec) {
         options.logger?.info(
           `subagent mapping: tool="${spec.toolName}" args={title:${spec.argMapping.title},type:${spec.argMapping.type},prompt:${spec.argMapping.prompt}} ` +
-          `phase_types={${DELEGATED_PHASES.map((p) => `${p}:${spec.phaseTypes[p]}`).join(',')}} (attempt ${attempt})`,
+          `type="${spec.typeId}" available=[${spec.availableTypes.map((t) => t.id).join(',')}] (attempt ${attempt})`,
         );
         return spec;
       }
