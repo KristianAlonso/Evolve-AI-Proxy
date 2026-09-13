@@ -60,6 +60,19 @@ re-mapea (restricción explícita: no preguntarle al modelo para detectarlo). Al
 la ruta re-ejecuta `mapSubagentTool` (la única llamada upstream del mecanismo); si el re-mapeo
 falla, se conserva la especificación anterior y se aplica el failover/re-emisión sobre ella.
 
+**Separación de listas de tools padre/subagente.** Los requests del padre y del subagente
+llevan **listas de tools distintas** dentro del mismo flujo de sesión. Reglas (confirmadas):
+
+1. `state.tools` / `state.tool_choice` (`LoopStateData`) se capturan en la **primera petición
+   del padre** y quedan **inmutables**: ninguna rama —ni parent-resume, ni las ramas del
+   subagente— las reescribe. El parent-resume evalúa el drift contra los `tools` **entrantes**
+   de la propia petición del padre, nunca contra (ni usando) la lista del subagente.
+2. La lista de tools del **subagente no se guarda en ningún sitio**: `runSubagentPhase` la
+   recibe localmente (`body.tools` del request). Al no haber referencia guardada, los cambios
+   en la lista del subagente entre sus propias peticiones **no se detectan ni actúan** sobre el
+   estado del padre (no hay nada contra qué comparar; el subagente sirve su petición como
+   request normal y su salida se graba en `phaseResults`).
+
 ### Alternativas Consideradas
 
 | Alternativa | Ventajas | Desventajas | Por qué no se eligió |
