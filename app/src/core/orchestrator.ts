@@ -33,9 +33,11 @@ import {
   buildEvaluateInstruction,
   buildPhasePrompt,
   buildPlanifyInstruction,
+  fitToContextWindow,
   goalHintForPlanify,
   INTERPRET_INSTRUCTION,
   isStructuredRejection,
+  toInternalMessages,
   toRenderedMessages,
 } from './phase-prompts.js';
 import { buildSpawnToolCall, newAgentId, type DelegatedPhase } from './subagent-spawn.js';
@@ -99,10 +101,16 @@ export class SubagentOrchestrator {
     // client (R2); the structured JSON stays internal.
     const t0 = Date.now();
     const sink = args.makeSink?.();
+    // Real-time phase announcement (reasoning delta — wire stays 100% OpenAI).
+    sink?.emitReasoningDelta(0, '[interpret] analyzing the request to derive the objective and sub-objectives\n');
     // ADR A-008: client base verbatim + last intermediate message + instruction (user, appended).
+    // SC-021: capped proactively to the resolved upstream window before the call.
     const interpretOpts = { model, logger: this.logger, traceId: args.traceId, abort_signal: args.abort_signal, passthrough: args.passthrough };
     const interpretPrompt = (rendered: boolean) =>
-      buildPhasePrompt(rendered ? toRenderedMessages(state.internalMessages) : state.internalMessages, state.lastMessage || null, INTERPRET_INSTRUCTION);
+      fitToContextWindow(
+        buildPhasePrompt(rendered ? toRenderedMessages(state.internalMessages) : state.internalMessages, state.lastMessage || null, INTERPRET_INSTRUCTION),
+        state.context_window_size,
+      );
     let interp;
     try {
       interp = await interpretRequest(this.provider, interpretPrompt(state.fellBackToRendered), interpretOpts, sink);
@@ -135,8 +143,13 @@ export class SubagentOrchestrator {
    * Parent resume: consume the stored phase result, advance the stage machine, then either emit
    * the next spawn ToolCall or deliver the final answer. Synchronous — no upstream call happens
    * here (the phase already ran in the subagent's request).
+   *
+   * The parent's incoming pile (`incomingMessages`) already contains the consumed phase output
+   * (as the spawn tool's result) — the client persisted it. After consumption the base is
+   * refreshed from that pile and `state.lastMessage` is cleared: the delegated flow never carries
+   * a second copy of a phase output (it only rides the parent's own conversation).
    */
-  resume(state: LoopStateData, sessionId: string): OrchestratorOutcome {
+  resume(state: LoopStateData, sessionId: string, incomingMessages?: UpstreamMessage[]): OrchestratorOutcome {
     if (state.stage !== 'done') {
       const agentId = state.pendingAgentId;
       const phaseResult = agentId ? state.phaseResults[agentId] : undefined;
@@ -186,15 +199,11 @@ export class SubagentOrchestrator {
               context_needed: [],
             };
             state.stage = 'execute';
-            // ADR A-008: the planify phase output becomes the process' last intermediate message.
-            state.lastMessage = (phaseResult ?? '').trim();
             break;
           }
           case 'execute': {
             const output = (phaseResult ?? '').trim() || '(no output)';
             state.lastOutput = output;
-            // ADR A-008: the execute output becomes the process' last intermediate message.
-            state.lastMessage = output;
             state.accumulatedSteps.push({
               iteration: state.round,
               objective: state.interpretation?.mainObjective,
@@ -206,8 +215,6 @@ export class SubagentOrchestrator {
             break;
           }
           case 'evaluate': {
-            // ADR A-008: the evaluate answer becomes the process' last intermediate message.
-            state.lastMessage = (phaseResult ?? '').trim();
             const decision = classifyEvaluation(phaseResult ?? '').decision;
             if (decision === 'complete') {
               state.decision = 'complete';
@@ -225,6 +232,12 @@ export class SubagentOrchestrator {
           }
           default:
             break;
+        }
+        // The consumed result already lives in the parent's pile (the spawn tool's result):
+        // refresh the base from the incoming conversation and drop our intermediate copy.
+        state.lastMessage = '';
+        if (incomingMessages && incomingMessages.length > 0) {
+          state.internalMessages = toInternalMessages(incomingMessages);
         }
         delete state.phaseResults[agentId];
         state.pendingAgentId = null;
@@ -280,11 +293,26 @@ export class SubagentOrchestrator {
         throw new Error(`unknown delegated phase: ${phase}`);
     }
     const phasePrompt = (rendered: boolean) =>
-      buildPhasePrompt(
-        rendered ? toRenderedMessages(state.internalMessages) : state.internalMessages,
-        state.lastMessage || null,
-        instruction,
+      fitToContextWindow(
+        buildPhasePrompt(
+          rendered ? toRenderedMessages(state.internalMessages) : state.internalMessages,
+          state.lastMessage || null,
+          instruction,
+        ),
+        state.context_window_size,
       );
+
+    // Real-time phase announcement: the subagent sees, as a reasoning delta BEFORE the upstream
+    // call, that the phase is starting and what it is about to do (wire stays 100% OpenAI).
+    if (args.sink) {
+      const what =
+        phase === 'execute'
+          ? (state.task?.description ?? state.originalInstruction).replace(/\s+/g, ' ').slice(0, 160)
+          : phase === 'planify'
+            ? 'planning the next concrete task'
+            : 'checking whether the original goal has been met';
+      args.sink.emitReasoningDelta(0, `[${phase}] ${what}\n`);
+    }
 
     const runWith = async (p: UpstreamMessage[]) => {
       const out = await callWithStreaming({

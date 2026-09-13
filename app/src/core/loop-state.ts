@@ -41,11 +41,20 @@ export interface LoopStateData {
   /** Latest execute-phase output. */
   lastOutput: string;
   /**
-   * ADR A-008: the ONLY intermediate message kept in the global process — the raw content of the
-   * LAST phase output. Every delegated phase prompt = internalMessages + (this, as one
-   * `assistant` turn) + instruction (user, appended at the end).
+   * ADR A-008: the ONLY intermediate message kept in the global process. In the delegated flow
+   * it holds the interpret phase's raw output until the first delegated result is consumed;
+   * after that it stays '' — every phase output already lives in the PARENT's pile (as the
+   * spawn tool's result) and `internalMessages` is refreshed from it on every resume.
+   * Every delegated phase prompt = internalMessages + (this, as one `assistant` turn, when set)
+   * + instruction (user, appended at the end).
    */
   lastMessage: string;
+  /**
+   * Resolved upstream context window (tokens). 0 = unlimited: phase prompts travel untouched
+   * (SC-022). When > 0 each phase prompt is capped proactively at 75% of it BEFORE the upstream
+   * call, so `ContextWindowExceeded` is prevented (SC-021), never hit.
+   */
+  context_window_size: number;
   /** ADR A-008 / R1: sticky — once the upstream rejects the structured conversation (4xx), every
    *  later phase of this session uses the rendered (flat) base. */
   fellBackToRendered: boolean;
@@ -67,6 +76,7 @@ export function newLoopState(args: {
   tools?: ToolDefinition[];
   tool_choice?: ToolChoice;
   spec: SubagentSpawnSpec | null;
+  context_window_size?: number;
 }): LoopStateData {
   return {
     stage: 'planify',
@@ -83,6 +93,7 @@ export function newLoopState(args: {
     task: null,
     lastOutput: '',
     lastMessage: '',
+    context_window_size: args.context_window_size ?? 0,
     fellBackToRendered: false,
     accumulatedSteps: [],
     phaseResults: {},

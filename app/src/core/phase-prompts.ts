@@ -66,6 +66,75 @@ export function buildEvaluateInstruction(originalInstruction: string): string {
 }
 
 /**
+ * Context-window guard (SC-021 / SC-022), re-implemented on top of the A-008 canonical shape.
+ * The proxy stays proactively below the upstream window so `ContextWindowExceeded` is PREVENTED,
+ * never hit: when the estimated prompt size crosses 75% of the window, the prompt is shrunk
+ * progressively — first the intermediate `assistant` turn is capped, then the OLDEST middle
+ * base messages are condensed to short markers (their role and tool_calls/tool_call_id structure
+ * are preserved so the conversation stays valid for the API; the first message, the newest
+ * exchange and the phase instruction always travel intact).
+ * `windowSize <= 0` = unlimited: the prompt travels untouched and the upstream decides (SC-022).
+ */
+const CONDENSE_THRESHOLD = 0.75; // SC-021
+const CONDENSED_MARKER = ' [... condensed to fit the context window]';
+const INTERMEDIATE_TRUNCATED_MARKER = ' [... truncated to fit the context window]';
+
+/** Rough token estimate for a prompt (~4 chars per token, same heuristic as the capture interceptor). */
+export function estimatePromptTokens(messages: UpstreamMessage[]): number {
+  let chars = 0;
+  for (const m of messages) {
+    chars += typeof m.content === 'string' ? m.content.length : JSON.stringify(m.content ?? '').length;
+    if (m.tool_calls && m.tool_calls.length > 0) chars += JSON.stringify(m.tool_calls).length;
+  }
+  return Math.ceil(chars / 4);
+}
+
+/** Cap `messages` so its estimated size stays within `windowSize` (no-op when `windowSize <= 0`). */
+export function fitToContextWindow(messages: UpstreamMessage[], windowSize: number): UpstreamMessage[] {
+  if (!(windowSize > 0)) return messages;
+  const budgetChars = Math.floor(windowSize * CONDENSE_THRESHOLD) * 4;
+  if (estimatedChars(messages) <= budgetChars) return messages;
+
+  const out = messages.map((m) => ({ ...m }));
+
+  // 1) Cap the intermediate assistant turn (second-to-last, before the appended instruction).
+  const intermediateIdx =
+    out.length >= 2 && out[out.length - 2].role === 'assistant' ? out.length - 2 : -1;
+  if (intermediateIdx !== -1) {
+    const content = typeof out[intermediateIdx].content === 'string' ? out[intermediateIdx].content : '';
+    if (content.length > budgetChars) {
+      out[intermediateIdx] = {
+        ...out[intermediateIdx],
+        content: content.slice(0, budgetChars) + INTERMEDIATE_TRUNCATED_MARKER,
+      };
+    }
+  }
+
+  // 2) Condense the oldest middle messages (keep the first message, the last 3, and the marker).
+  if (estimatedChars(out) > budgetChars && out.length > 5) {
+    const end = out.length - 3; // last 3 always intact (newest exchange + instruction)
+    for (let i = 1; i < end; i++) {
+      const m = out[i];
+      const content = typeof m.content === 'string' ? m.content : JSON.stringify(m.content ?? '');
+      if (content.length > 160) {
+        out[i] = { ...m, content: content.slice(0, 160) + CONDENSED_MARKER };
+      }
+    }
+  }
+
+  return out;
+}
+
+function estimatedChars(messages: UpstreamMessage[]): number {
+  let chars = 0;
+  for (const m of messages) {
+    chars += typeof m.content === 'string' ? m.content.length : JSON.stringify(m.content ?? '').length;
+    if (m.tool_calls && m.tool_calls.length > 0) chars += JSON.stringify(m.tool_calls).length;
+  }
+  return chars;
+}
+
+/**
  * ADR A-008 — the ONLY conversation shape for phase calls. The client base comes first untouched;
  * the last intermediate message (when any) rides as a single `assistant` turn; the phase
  * instruction is appended last as a `user` message. No system message is ever added.

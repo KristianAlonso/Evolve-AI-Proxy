@@ -18,6 +18,7 @@ import {
   buildEvaluateInstruction,
   buildPhasePrompt,
   buildPlanifyInstruction,
+  fitToContextWindow,
   goalHintForPlanify,
   INTERPRET_INSTRUCTION,
   isStructuredRejection,
@@ -131,8 +132,8 @@ export class AgentLoop {
     originalInstruction: string,
     messages: UpstreamMessage[],
   ): Promise<{ decision: LoopDecision; finalResult: FinalResultData; trace: LoopTrace[] }> {
-    const o = this.resolvedOptions();
-    if (o.max_rounds < 1) throw new Error('max_rounds must be >= 1');
+    const loopConfig = this.resolvedOptions();
+    if (loopConfig.max_rounds < 1) throw new Error('max_rounds must be >= 1');
 
     let decision: LoopDecision = 'continue';
     const trace: LoopTrace[] = [];
@@ -143,9 +144,9 @@ export class AgentLoop {
     const startedAt = Date.now();
 
     this.logger.info(
-      `agent loop start: model=${o.model ?? 'auto'} max_rounds=${o.max_rounds} messages=${messages.length} ` +
-      `tools=${o.tools?.length ? o.tools.map((t) => t.function.name).join(',') : '-'} ` +
-      `tool_choice=${o.tool_choice ?? '-'} resume=${buildToolTranscript(messages).length > 0}`,
+      `agent loop start: model=${loopConfig.model ?? 'auto'} max_rounds=${loopConfig.max_rounds} messages=${messages.length} ` +
+      `tools=${loopConfig.tools?.length ? loopConfig.tools.map((t) => t.function.name).join(',') : '-'} ` +
+      `tool_choice=${loopConfig.tool_choice ?? '-'} resume=${buildToolTranscript(messages).length > 0}`,
     );
 
     // R1 (FASE 6): assistant turns (including the client's tool_call/tool-result exchange) travel
@@ -159,7 +160,7 @@ export class AgentLoop {
     this.renderedInternal = toRenderedMessages(messages);
     this.lastMessage = null; // intermediate API messages are NOT kept — only the last one is
 
-    for (; round < o.max_rounds; round++) {
+    for (; round < loopConfig.max_rounds; round++) {
       try {
         // SC-023: abort before any upstream call when the sink is already gone.
         if (this.sink?.isDisconnected()) break;
@@ -167,7 +168,7 @@ export class AgentLoop {
         // stop) halts the loop before any further upstream call; the in-flight call, if any, is
         // cancelled through the same AbortSignal. Unlike a silent sink disconnect this is an
         // explicit failure of the run, so it records decision='error'.
-        if (o.abort_signal?.aborted) {
+        if (loopConfig.abort_signal?.aborted) {
           if (decision === 'continue') decision = 'error';
           this.logger.warn(`agent loop stopped: client aborted (round ${round + 1})`);
           break;
@@ -179,10 +180,11 @@ export class AgentLoop {
         // FASE 1: pass the sink as the live emitter so interpretation reasoning deltas reach the
         // client WHILE the upstream generates them. When the provider streamed, the full-text
         // fallback emit below would duplicate what already left on the wire — skip it then.
+        this.announcePhase(0, 'interpret', 'analyzing the request to derive the objective and sub-objectives');
         const interpT0 = Date.now();
         this.countCall('interpret');
         const interp = await this.withShapeFallback((rendered) =>
-          interpretRequest(this.provider, this.phasePrompt(rendered, INTERPRET_INSTRUCTION), { model: o.model, logger: this.logger, traceId: o.traceId, abort_signal: o.abort_signal, passthrough: o.passthrough }, this.sink),
+          interpretRequest(this.provider, this.phasePrompt(rendered, INTERPRET_INSTRUCTION), { model: loopConfig.model, logger: this.logger, traceId: loopConfig.traceId, abort_signal: loopConfig.abort_signal, passthrough: loopConfig.passthrough }, this.sink),
         );
         // ADR A-008: the interpreter's raw reply becomes the process' last intermediate message.
         this.lastMessage = interp.raw || null;
@@ -198,7 +200,13 @@ export class AgentLoop {
         // ---- Planning / task selection. Consume pre-generated tasks in order, refine when out. ----
         this.emitPhase('planning', { step: 'planify' });
         const planT0 = Date.now();
-        const task = tasks[round] ?? await this.planify(goalHintForPlanify(originalInstruction, lastOutput), o);
+        let task: AgentTask;
+        if (tasks[round]) {
+          task = tasks[round];
+        } else {
+          this.announcePhase(0, 'planify', 'planning the next concrete task');
+          task = await this.planify(goalHintForPlanify(originalInstruction, lastOutput), loopConfig);
+        }
         this.logger.info(`plan (round ${round + 1}): ${Date.now() - planT0}ms task="${task.description.replace(/\s+/g, ' ').slice(0, 160)}"`);
         trace.push({ iteration: round + 1, phase: 'planning', task_id: task.id, content: task.description });
 
@@ -206,11 +214,12 @@ export class AgentLoop {
         this.emitPhase('executing_task', { step: `execute #${round + 1}` });
         // ADR A-008: progress is NOT a step list — the previous phase's output already rides as
         // the single `assistant` turn in the base; the prompt ends on the task instruction (user).
+        this.announcePhase(round + 1, 'execute', `executing: ${task.description.replace(/\s+/g, ' ').slice(0, 160)}`);
         const taskContent = this.buildExecuteContent(task, messages);
         const makeExecuteStep = (rendered: boolean): ExecStep => async () => {
           // The provider call options carry the delegated client tools (FASE 2); interpretation /
           // planning / evaluation never receive them.
-          const callOptions = { tools: o.tools, tool_choice: o.tool_choice, logger: this.logger, trace_id: o.traceId, abort_signal: o.abort_signal, passthrough: o.passthrough };
+          const callOptions = { tools: loopConfig.tools, tool_choice: loopConfig.tool_choice, logger: this.logger, trace_id: loopConfig.traceId, abort_signal: loopConfig.abort_signal, passthrough: loopConfig.passthrough };
 
           // Counted BEFORE the call: a failed upstream call is still an upstream call — the metric
           // must reflect what left the proxy (the deterministic-error path threw before the old
@@ -219,7 +228,7 @@ export class AgentLoop {
 
           // No watcher, or a provider without completeStream (unit-test stubs): fully buffered call.
           if (!this.sink) {
-            const res = await this.provider.complete(o.model, this.phasePrompt(rendered, taskContent), callOptions);
+            const res = await this.provider.complete(loopConfig.model, this.phasePrompt(rendered, taskContent), callOptions);
             return { output: res.content ?? '', reasoning: res.reasoning || '', doomedLoop: { detected: false, repetitions: 0 }, tool_calls: res.tool_calls };
           }
 
@@ -233,7 +242,7 @@ export class AgentLoop {
 
           const { result } = await callWithStreaming({
             provider: this.provider,
-            model: o.model,
+            model: loopConfig.model,
             messages: this.phasePrompt(rendered, taskContent),
             options: callOptions,
             surfaceDelta: (chunk) => {
@@ -248,7 +257,7 @@ export class AgentLoop {
               // Detect a doom-loop mid-generation so a runaway is visible while the model still
               // generates. detectDoomLoop is the same pure function used post-hoc by the retry guard.
               acc += reasoning + content;
-              const doomed = detectDoomLoop(acc, o.doom_loop_threshold);
+              const doomed = detectDoomLoop(acc, loopConfig.doom_loop_threshold);
               if (doomed.detected) lastDoomed = doomed;
             },
           });
@@ -259,9 +268,9 @@ export class AgentLoop {
         let outcome;
         const execT0 = Date.now();
         try {
-          outcome = await this.runExecuteWithFallback(makeExecuteStep, round, o);
+          outcome = await this.runExecuteWithFallback(makeExecuteStep, round, loopConfig);
         } catch (err) {
-          if (isAbortError(err) || o.abort_signal?.aborted) {
+          if (isAbortError(err) || loopConfig.abort_signal?.aborted) {
             this.logger.warn(`execute aborted (round ${round + 1}): ${Date.now() - execT0}ms — stopped per client request`);
           } else {
             this.logger.error(`execute failed (round ${round + 1}): ${Date.now() - execT0}ms: ${String(err)}`);
@@ -278,7 +287,7 @@ export class AgentLoop {
         const result: TaskResult = outcome.result;
         if (result.status === 'failed') {
           const aborted =
-            o.abort_signal?.aborted === true ||
+            loopConfig.abort_signal?.aborted === true ||
             (result.error !== undefined && isAbortError({ message: result.error }));
           if (aborted) {
             // The client interrupted (disconnect or explicit stop): no refusal, no doom loop —
@@ -333,6 +342,7 @@ export class AgentLoop {
 
         // ---- Binary evaluation (SC-007/008). ----
         this.emitPhase('evaluating', { step: `evaluate #${round + 1}` });
+        this.announcePhase(round + 1, 'evaluate', 'checking whether the original goal has been met');
         // FASE 1: stream the evaluator's reasoning live too; on the buffered path keep the previous
         // whole-text emit so no tracing is lost when the provider cannot stream.
         const evalT0 = Date.now();
@@ -340,7 +350,7 @@ export class AgentLoop {
         // ADR A-008: the evaluator judges the assistant turn right before its instruction — the
         // execute output, kept as the process' last intermediate message. No context block.
         const evalCall = await this.withShapeFallback((rendered) =>
-          evaluateTask(this.provider, this.phasePrompt(rendered, buildEvaluateInstruction(originalInstruction)), { model: o.model, logger: this.logger, traceId: o.traceId, abort_signal: o.abort_signal, passthrough: o.passthrough }, this.sink),
+          evaluateTask(this.provider, this.phasePrompt(rendered, buildEvaluateInstruction(originalInstruction)), { model: loopConfig.model, logger: this.logger, traceId: loopConfig.traceId, abort_signal: loopConfig.abort_signal, passthrough: loopConfig.passthrough }, this.sink),
         );
         this.lastMessage = evalCall.raw || null;
         this.logger.info(`evaluate (round ${round + 1}): ${Date.now() - evalT0}ms decision=${evalCall.decision}`);
@@ -362,11 +372,11 @@ export class AgentLoop {
         // ---- Replenish the task queue from a fresh interpretation when we run out. ----
         if (round + 1 >= tasks.length) {
           const refined = await generateTasks(this.provider, originalInstruction, interp.interpretation);
-          tasks = refined.length > 1 ? refined : [await this.planify(goalHintForPlanify(originalInstruction, lastOutput), o)];
+          tasks = refined.length > 1 ? refined : [await this.planify(goalHintForPlanify(originalInstruction, lastOutput), loopConfig)];
         }
       } catch (err) {
         // Any upstream failure during interpretation, planning, execution or evaluation SC-014.
-        if (isAbortError(err) || o.abort_signal?.aborted) {
+        if (isAbortError(err) || loopConfig.abort_signal?.aborted) {
           this.logger.warn(`agent loop aborted (round ${round + 1}): ${String(err)} — stopping per client request (no retry)`);
         } else {
           this.logger.error(`agent loop step failed (round ${round + 1}): ${String(err)}`);
@@ -391,7 +401,7 @@ export class AgentLoop {
       final_output: lastOutput || '',
       iterations_completed: accumulatedSteps.length,
       decision,
-      max_rounds: o.max_rounds,
+      max_rounds: loopConfig.max_rounds,
       tasks_executed: accumulatedSteps.map((s) => ({ id: s.task_id ?? `iter-${s.iteration}`, status: 'completed', output: s.output })),
       reasoning_traces_summary: {
         phases_completed: [...this.phaseSet],
@@ -463,16 +473,16 @@ export class AgentLoop {
     return `Accumulated context:\n${parts}`;
   }
 
-  private async planify(goalHint: string, o: ReturnType<AgentLoop['resolvedOptions']>): Promise<AgentTask> {
+  private async planify(goalHint: string, loopConfig: ReturnType<AgentLoop['resolvedOptions']>): Promise<AgentTask> {
     this.countCall('planify');
     // FASE 1: planning reasoning also streams live to a watching client. The task-description JSON
     // is internal — only the thinking path is surfaced (same rule as interpretation/evaluation).
     const { result } = await this.withShapeFallback((rendered) =>
       callWithStreaming({
         provider: this.provider,
-        model: o.model,
+        model: loopConfig.model,
         messages: this.phasePrompt(rendered, buildPlanifyInstruction(goalHint)),
-        options: { logger: this.logger, trace_id: o.traceId, abort_signal: o.abort_signal, passthrough: o.passthrough },
+        options: { logger: this.logger, trace_id: loopConfig.traceId, abort_signal: loopConfig.abort_signal, passthrough: loopConfig.passthrough },
         surfaceDelta: this.sink
           ? (chunk) => {
               const reasoning = typeof chunk.reasoning === 'string' ? chunk.reasoning : '';
@@ -492,7 +502,20 @@ export class AgentLoop {
    * intermediate message as a single `assistant` turn, the instruction appended at the end (user).
    */
   private phasePrompt(rendered: boolean, instruction: string): UpstreamMessage[] {
-    return buildPhasePrompt(rendered ? this.renderedInternal : this.structuredInternal, this.lastMessage, instruction);
+    // SC-021: stay proactively within the resolved upstream window before every upstream call.
+    return fitToContextWindow(
+      buildPhasePrompt(rendered ? this.renderedInternal : this.structuredInternal, this.lastMessage, instruction),
+      this.opts.context_window_size ?? 4096,
+    );
+  }
+
+  /**
+   * Real-time phase announcement: BEFORE the upstream call, the client sees a reasoning delta with
+   * the phase starting and what it is about to do (wire stays 100% OpenAI — no custom event types).
+   * No sink (non-streaming) = no announcement.
+   */
+  private announcePhase(iteration: number, phase: string, what: string): void {
+    if (this.sink) this.sink.emitReasoningDelta(iteration, `[${phase}] ${what}\n`);
   }
 
   /**
@@ -522,13 +545,13 @@ export class AgentLoop {
   private async runExecuteWithFallback(
     makeExecuteStep: (rendered: boolean) => ExecStep,
     round: number,
-    o: ReturnType<AgentLoop['resolvedOptions']>,
+    loopConfig: ReturnType<AgentLoop['resolvedOptions']>,
   ) {
-    const retryOpts = { maxRetries: o.max_retries, doomLoopThreshold: o.doom_loop_threshold, abortSignal: o.abort_signal };
+    const retryOpts = { maxRetries: loopConfig.max_retries, doomLoopThreshold: loopConfig.doom_loop_threshold, abortSignal: loopConfig.abort_signal };
     try {
       return await withAutoHealingRetry(makeExecuteStep(this.fellBackToRendered), retryOpts);
     } catch (err) {
-      if (this.fellBackToRendered || isAbortError(err) || o.abort_signal?.aborted || !isStructuredRejection(err)) {
+      if (this.fellBackToRendered || isAbortError(err) || loopConfig.abort_signal?.aborted || !isStructuredRejection(err)) {
         throw err;
       }
       this.fellBackToRendered = true;

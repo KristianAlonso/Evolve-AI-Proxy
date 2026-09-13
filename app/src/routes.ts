@@ -441,7 +441,9 @@ export async function createApp(options: CreateAppOptions = {}): Promise<Fastify
         }
       }
       const orchestrator = new SubagentOrchestrator(provider, log);
-      const outcome = orchestrator.resume(session.loopState, sessionId);
+      // The parent's pile already holds the consumed phase result (as the spawn tool's result):
+      // the orchestrator refreshes its base from it (ADR A-008 delegated flow).
+      const outcome = orchestrator.resume(session.loopState, sessionId, messages);
       const finalResult = toFinalResult(session.loopState, outcome);
       if (body.stream) {
         const writer = new SseWriter(reply as unknown as FastifyReply, log);
@@ -476,6 +478,7 @@ export async function createApp(options: CreateAppOptions = {}): Promise<Fastify
         tools: body.tools,
         tool_choice: body.tool_choice,
         spec: null,
+        context_window_size: loopOpts.context_window_size,
       });
       let writerRef: SseWriter | undefined;
       const started = await new SubagentOrchestrator(provider, log).start({

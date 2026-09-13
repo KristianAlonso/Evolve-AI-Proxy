@@ -136,6 +136,7 @@ describe('ADR A-008 — phase-prompt shaping (inline AgentLoop)', () => {
       task: null,
       lastOutput: '',
       lastMessage: 'The planify phase finished proposing a task.',
+      context_window_size: 0,
       fellBackToRendered: false,
       accumulatedSteps: [],
       phaseResults: {},

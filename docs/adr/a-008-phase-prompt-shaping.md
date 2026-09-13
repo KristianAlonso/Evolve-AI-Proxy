@@ -72,10 +72,9 @@ donde:
   (FASE 6, delegación a subagentes) comparten los mismos builders de instrucción y la misma
   forma canónica; el orquestador aplica el fallback sticky de forma estructurada→rendered
   a **todas** las fases delegadas (antes solo execute).
-- **Estado mínimo serializable**: `LoopStateData` gana `lastMessage: string` (la última
-  salida cruda de fase — sobrevive serialización para el parent-resume) y
-  `fellBackToRendered: boolean` (sticky shape). `context_window_size` queda como opción
-  reservada (no-op).
+- **Estado mínimo serializable**: `LoopStateData` gana `lastMessage: string`,
+  `fellBackToRendered: boolean` (sticky shape) y `context_window_size: number`
+  (ver Refinimientos 1 y 3).
 - **El mapper de subagentes** (`subagent-mapper.ts`) es una excepción deliberada: no es
   una fase del bucle — no lleva la conversación del cliente (es una meta-llama interna
   sobre las tools del cliente), así que sigue montando su propio prompt (system + user).
@@ -113,3 +112,33 @@ donde:
 - **Riesgo**: si una fase necesita contexto antiguo (varias rondas atrás), debe
   re-derivarse de la conversación del cliente + la última salida; mitiguado por el
   `goalHint` de planify (solo la primera ronda) y la referencia al original en evaluate.
+
+## Refinimientos (post-implementación inicial)
+
+1. **Control de ventana de contexto (SC-021/SC-022) — `fitToContextWindow`**
+   (`phase-prompts.ts`), aplicado a TODA llamada de fase (inline y delegada) ANTES de
+   salir, para que el `ContextWindowExceeded` se *previene*, nunca se pilla:
+   - Estimación de tokens ≈ chars/4 (misma heurística del interceptador de capturas);
+     presupuesto = **75 %** de `context_window_size` (umbral SC-021).
+   - Reducción progresiva: (1) topa el turno `assistant` intermedio (2.º desde el final)
+     si excede el presupuesto; (2) condensa los mensajes viejos de la base a marcadores
+     cortos — siempre íntegros: primer mensaje, los últimos 3 y la instrucción de fase; se
+     conserva rol y estructura `tool_calls`/`tool_call_id` para que la conversación siga
+     siendo válida para la API.
+   - `context_window_size = 0` (desconocida) = sin límite: el prompt sale intacto y el
+     upstream decide (SC-022). El campo vuelve a `LoopStateData` para sobrevivir la
+     serialización del parent-resume.
+2. **Anuncio de fase en tiempo real** — antes de cada llamada upstream de fase, el cliente
+   recibe un delta de razonamiento `[fase] <qué va a hacer>` (interpret/planify/execute/
+   evaluate, tanto inline como delegadas; execute incluye la descripción de la tarea).
+   El wire sigue siendo 100 % OpenAI (no se inventan tipos de evento).
+3. **Flujo delegado: la salida de la fase la persiste el cliente** — el cliente ya guarda
+   la salida de cada fase en su historial (resultado del tool call de spawn), por tanto:
+   - `resume(state, sessionId, incomingMessages)` refresca `state.internalMessages` desde
+     el montón entrante del padre y limpia `state.lastMessage` tras consumir un resultado:
+     la salida de la fase NUNCA viaja en dos copias (no se añade un turno `assistant`
+     extra por encima del tool result).
+   - `lastMessage` solo viaja con el raw del interpret (la única salida de fase que NO
+     está en el historial del padre).
+   - El bucle inline (`AgentLoop`) conserva su `this.lastMessage` en memoria (no se
+     serializa: un request inline es una sola llamada).

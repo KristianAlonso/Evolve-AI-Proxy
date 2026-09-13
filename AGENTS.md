@@ -60,6 +60,9 @@ Toda llamada upstream de una fase del bucle (inline u orquestador) usa **una sol
 
 - El `system` del cliente se conserva byte a byte; el proxy **nunca añade `system`** — las instrucciones de fase van al final como `user`.
 - **Solo se conserva el último mensaje intermedio** (la salida cruda de la última fase, un único turno `assistant`); el historial de fases anterior se descarta — sin `ContextManager`.
+- **Control de ventana de contexto (SC-021/SC-022)**: cada llamada de fase pasa por `fitToContextWindow` (presupuesto 75 % de `context_window_size`; reduce primero el turno intermedio y luego condensa los mensajes viejos de la base; `0` = sin límite).
+- **Anuncio de fase en tiempo real**: antes de cada fase (inline o delegada) el cliente recibe un delta de razonamiento `[fase] <qué va a hacer>` (wire 100 % OpenAI).
+- **Flujo delegado**: la salida de cada fase la persiste el cliente como tool result; `resume()` refresca la base desde el montón entrante del padre y limpia `lastMessage` (solo el raw del interpret viaja como intermedio propio).
 - Inline (`AgentLoop`) y orquestador (`SubagentOrchestrator`, FASE 6) comparten los mismos builders; el fallback sticky estructur→rendered (4xx) se aplica a todas las fases.
 - Detalle: [docs/adr/a-008-phase-prompt-shaping.md](./docs/adr/a-008-phase-prompt-shaping.md)
 

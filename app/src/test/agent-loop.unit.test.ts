@@ -69,11 +69,15 @@ describe('AgentLoop', () => {
     const { decision } = await loop.run('stream it', [{ role: 'user', content: 'stream it' }]);
 
     expect(decision).toBe('complete');
-    // The VERY FIRST delta on the wire is the interpretation's reasoning — thinking reaches the
-    // client during interpret, before any execution output exists.
-    expect(sink.thinking[0]).toBe('interpreted');
+    // The VERY FIRST delta on the wire is the interpret phase announcement: the client sees each
+    // phase starting and what it is about to do BEFORE the upstream call (real-time, no custom
+    // event types — just reasoning deltas on the OpenAI wire).
+    expect(sink.thinking[0]).toBe('[interpret] analyzing the request to derive the objective and sub-objectives\n');
+    // Every subsequent phase announces itself the same way…
     // Execute output and evaluator reasoning also arrived as live deltas (not one late blob).
     const all = sink.thinking.join('');
+    expect(all).toContain('[execute] executing: '); // announces the concrete task
+    expect(all).toContain('[evaluate] checking whether the original goal has been met\n');
     expect(all).toContain('interpreted');
     expect(all).toContain('Task succeeded.');
     expect(all).toContain('yes');
