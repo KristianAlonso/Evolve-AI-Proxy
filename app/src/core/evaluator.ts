@@ -34,7 +34,7 @@ export async function evaluateTask(
   messages: UpstreamMessage[],
   options?: { model: string | null; logger?: TraceLogger; traceId?: string; abort_signal?: AbortSignal; passthrough?: Record<string, unknown> },
   emitter?: LiveEmitter,
-): Promise<{ decision: 'complete' | 'continue'; reasoning: string; raw: string; streamed: boolean }> {
+): Promise<{ decision: 'complete' | 'continue'; reasoning: string; raw: string; streamed: boolean; usage: NormalizedResult['usage'] }> {
   const { result, streamed } = await callWithStreaming({
     provider,
     model: options?.model ?? null, // concrete user-selected model — never "auto" (no-auto rule)
@@ -49,7 +49,7 @@ export async function evaluateTask(
   });
   const raw = result.content?.trim() || '';
   // If the model produced no usable content, treat as "continue".
-  if (!raw) return { decision: 'continue', reasoning: result.reasoning, raw, streamed };
+  if (!raw) return { decision: 'continue', reasoning: result.reasoning, raw, streamed, usage: result.usage };
 
   const classification = classifyEvaluation(raw);
   return {
@@ -57,5 +57,6 @@ export async function evaluateTask(
     reasoning: `${result.reasoning}\nnormalized: ${classification.normalized}`,
     raw,
     streamed,
+    usage: result.usage,
   };
 }

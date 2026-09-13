@@ -21,10 +21,11 @@
 // Fail-safe: when the mapping finds no subagent-spawn tool (or the model cannot map it), `start`
 // returns null and the caller degrades to the classic inline AgentLoop — no request ever breaks.
 
+import env from '../config.js';
 import { isAbortError } from '../provider/types.js';
 import type { ChatProvider } from '../provider/types.js';
 import type { TraceLogger } from '../logger.js';
-import type { LoopDecision, ToolCall, ToolChoice, ToolDefinition, UpstreamMessage } from '../types.js';
+import type { LoopDecision, TokenUsage, ToolCall, ToolChoice, ToolDefinition, UpstreamMessage } from '../types.js';
 import { mapSubagentTool } from './subagent-mapper.js';
 import { interpretRequest } from './interpreter.js';
 import { classifyEvaluation } from './evaluator.js';
@@ -33,7 +34,9 @@ import {
   buildEvaluateInstruction,
   buildPhasePrompt,
   buildPlanifyInstruction,
-  fitToContextWindow,
+  COMPACT_PENDING_NOTICE,
+  contextFull,
+  estimatePromptTokens,
   goalHintForPlanify,
   INTERPRET_INSTRUCTION,
   isStructuredRejection,
@@ -53,15 +56,22 @@ export interface SubagentBinding {
 /** What a parent-facing orchestrator outcome carries to the routes layer. */
 export interface OrchestratorOutcome {
   /** 'tool_call' = the parent must call the spawn tool (stream/JSON carries the ToolCall).
-   *  'final' = the loop is over; `finalOutput` is the client's answer. */
+   *  'final' = the loop is over; `finalOutput` = the client's answer. */
   kind: 'tool_call' | 'final';
   toolCall?: ToolCall;
   decision: LoopDecision;
   finalOutput: string;
+  /** Real upstream usage to relay to the client (its token tracking drives the client-side compaction). */
+  usage: TokenUsage | null;
 }
 
 export class SubagentOrchestrator {
-  constructor(private provider: ChatProvider, private logger: TraceLogger) {}
+  constructor(
+    private provider: ChatProvider,
+    private logger: TraceLogger,
+    /** Fraction of the context window at which compaction is delegated to the client (env-driven by default). */
+    private compactThreshold: number = env.CONTEXT_COMPACT_THRESHOLD,
+  ) {}
 
   /**
    * First parent request with client tools: mapping + interpret, then emit the spawn ToolCall for
@@ -104,13 +114,11 @@ export class SubagentOrchestrator {
     // Real-time phase announcement (reasoning delta — wire stays 100% OpenAI).
     sink?.emitReasoningDelta(0, '[interpret] analyzing the request to derive the objective and sub-objectives\n');
     // ADR A-008: client base verbatim + last intermediate message + instruction (user, appended).
-    // SC-021: capped proactively to the resolved upstream window before the call.
+    // Never truncated: if the context is already past the compaction threshold after this call,
+    // the loop is interrupted and the compaction is delegated to the client (compactPending).
     const interpretOpts = { model, logger: this.logger, traceId: args.traceId, abort_signal: args.abort_signal, passthrough: args.passthrough };
     const interpretPrompt = (rendered: boolean) =>
-      fitToContextWindow(
-        buildPhasePrompt(rendered ? toRenderedMessages(state.internalMessages) : state.internalMessages, state.lastMessage || null, INTERPRET_INSTRUCTION),
-        state.context_window_size,
-      );
+      buildPhasePrompt(rendered ? toRenderedMessages(state.internalMessages) : state.internalMessages, state.lastMessage || null, INTERPRET_INSTRUCTION);
     let interp;
     try {
       interp = await interpretRequest(this.provider, interpretPrompt(state.fellBackToRendered), interpretOpts, sink);
@@ -129,12 +137,29 @@ export class SubagentOrchestrator {
     state.totalUpstreamCalls += 1;
     state.interpretation = interpretation;
     state.stage = 'planify';
+    state.lastUsage = interp.usage ?? null;
+    // Client-delegated compaction: the context is already at/over the threshold (the client's
+    // own tracking will agree once it relays the usage). The spawn is still emitted, but the
+    // subagent's phase call is PRE-BLOCKED (notice, no upstream call) until the client compacts.
+    if (contextFull(interp.usage, state.context_window_size, this.compactThreshold)) {
+      state.compactPending = true;
+      this.logger.warn(
+        `orchestrator start: context at ${interp.usage?.prompt_tokens}/${state.context_window_size} tokens (>= ${Math.round(this.compactThreshold * 100)}%) — ` +
+        `interrupting before the delegated phase; waiting for the client to compact and resume`,
+      );
+    }
     this.logger.info(
       `orchestrator start: interpret ${Date.now() - t0}ms objective="${interpretation.mainObjective.replace(/\s+/g, ' ').slice(0, 160)}"`,
     );
 
     return {
-      outcome: { kind: 'tool_call', toolCall: this.emitSpawn(state, sessionId), decision: 'tool_calls_pending', finalOutput: '' },
+      outcome: {
+        kind: 'tool_call',
+        toolCall: this.emitSpawn(state, sessionId),
+        decision: 'tool_calls_pending',
+        finalOutput: '',
+        usage: state.lastUsage,
+      },
       sink,
     };
   }
@@ -151,6 +176,53 @@ export class SubagentOrchestrator {
    */
   resume(state: LoopStateData, sessionId: string, incomingMessages?: UpstreamMessage[]): OrchestratorOutcome {
     if (state.stage !== 'done') {
+      // Client-delegated compaction in flight: the interrupted phase's result is NOT consumed
+      // (it is a pause notice, never a real output). Adopt the client's incoming pile — that is
+      // the whole of the new (compacted) context — and re-emit the pending spawn. While the
+      // incoming pile is still at/over the threshold the spawn is re-emitted STABLY (same
+      // agent_id); the subagent's phase call stays pre-blocked (no upstream call, no overflow).
+      if (state.compactPending) {
+        if (incomingMessages && incomingMessages.length > 0) {
+          state.internalMessages = toInternalMessages(incomingMessages);
+        }
+        const estimate = estimatePromptTokens(
+          buildPhasePrompt(state.internalMessages, state.lastMessage || null, this.phaseInstructionFor(state)),
+        );
+        const stillFull = contextFull({ prompt_tokens: estimate }, state.context_window_size, this.compactThreshold);
+        if (stillFull) {
+          this.logger.warn(
+            `orchestrator resume: compactPending and the incoming context is still over the threshold ` +
+            `(estimate=${estimate} tokens, window=${state.context_window_size}, threshold=${Math.round(this.compactThreshold * 100)}%) — ` +
+            `re-emitting the pending spawn (agent_id=${state.pendingAgentId ?? '-'}, stage=${state.stage} round=${state.round})`,
+          );
+          return {
+            kind: 'tool_call',
+            toolCall: this.emitSpawn(state, sessionId, state.pendingAgentId ?? undefined),
+            decision: 'tool_calls_pending',
+            finalOutput: '',
+            usage: state.lastUsage,
+          };
+        }
+        // The client actually compacted: DISCARD the old stored context entirely and continue
+        // the interrupted phase with the new (compacted) pile.
+        state.compactPending = false;
+        state.lastMessage = ''; // the interrupted intermediate output is stale — drop it
+        if (state.pendingAgentId) delete state.phaseResults[state.pendingAgentId]; // pause notice — not a result
+        state.pendingAgentId = null;
+        state.spawnRetries = 0;
+        this.logger.info(
+          `orchestrator resume: client compacted the context (estimate=${estimate} tokens) — ` +
+          `resuming the ${state.stage} phase (round=${state.round}) with the compacted pile`,
+        );
+        return {
+          kind: 'tool_call',
+          toolCall: this.emitSpawn(state, sessionId),
+          decision: 'tool_calls_pending',
+          finalOutput: '',
+          usage: state.lastUsage,
+        };
+      }
+
       const agentId = state.pendingAgentId;
       const phaseResult = agentId ? state.phaseResults[agentId] : undefined;
       if (agentId && phaseResult === undefined) {
@@ -176,6 +248,7 @@ export class SubagentOrchestrator {
             toolCall: this.emitSpawn(state, sessionId),
             decision: 'tool_calls_pending',
             finalOutput: '',
+            usage: state.lastUsage,
           };
         }
         this.logger.info(
@@ -186,6 +259,7 @@ export class SubagentOrchestrator {
           toolCall: this.emitSpawn(state, sessionId, agentId),
           decision: 'tool_calls_pending',
           finalOutput: '',
+          usage: state.lastUsage,
         };
       }
       if (!agentId) {
@@ -249,9 +323,9 @@ export class SubagentOrchestrator {
       this.logger.info(
         `orchestrator done: decision=${state.decision} round=${state.round} upstream_calls=${state.totalUpstreamCalls} output_len=${state.finalOutput.length}`,
       );
-      return { kind: 'final', decision: state.decision ?? 'complete', finalOutput: state.finalOutput };
+      return { kind: 'final', decision: state.decision ?? 'complete', finalOutput: state.finalOutput, usage: state.lastUsage };
     }
-    return { kind: 'tool_call', toolCall: this.emitSpawn(state, sessionId), decision: 'tool_calls_pending', finalOutput: '' };
+    return { kind: 'tool_call', toolCall: this.emitSpawn(state, sessionId), decision: 'tool_calls_pending', finalOutput: '', usage: state.lastUsage };
   }
 
   /**
@@ -270,10 +344,23 @@ export class SubagentOrchestrator {
     abort_signal?: AbortSignal;
     /** ADR A-007 (passthrough-intacto): the client's request parameters, forwarded as-is. */
     passthrough?: Record<string, unknown>;
-  }): Promise<{ content: string; reasoning: string }> {
+  }): Promise<{ content: string; reasoning: string; usage: TokenUsage | null; compactPending: boolean }> {
     const { state, binding, model } = args;
     const { agentId, phase } = binding;
     const t0 = Date.now();
+
+    // Client-delegated compaction in flight: PRE-BLOCK. No upstream call is made (it would
+    // overflow the window); the subagent receives a short pause notice and the pending spawn is
+    // re-emitted by the parent until the client's compacted context arrives.
+    if (state.compactPending) {
+      this.logger.warn(
+        `subagent phase: phase=${phase} agent_id=${agentId} PRE-BLOCKED — context compaction pending (no upstream call)`,
+      );
+      if (args.sink) {
+        args.sink.emitReasoningDelta(0, `[${phase}] context compaction pending — waiting for the client to compact the conversation\n`);
+      }
+      return { content: COMPACT_PENDING_NOTICE, reasoning: '', usage: state.lastUsage, compactPending: true };
+    }
 
     // ADR A-008: delegated phases use the SAME single shape as the inline loop — client base
     // verbatim + the last intermediate message (one `assistant` turn) + the instruction (user,
@@ -292,14 +379,13 @@ export class SubagentOrchestrator {
       default:
         throw new Error(`unknown delegated phase: ${phase}`);
     }
+    // Never truncated: if the context is over the threshold AFTER this call, the loop is
+    // interrupted and the compaction is delegated to the client (compactPending + pause notice).
     const phasePrompt = (rendered: boolean) =>
-      fitToContextWindow(
-        buildPhasePrompt(
-          rendered ? toRenderedMessages(state.internalMessages) : state.internalMessages,
-          state.lastMessage || null,
-          instruction,
-        ),
-        state.context_window_size,
+      buildPhasePrompt(
+        rendered ? toRenderedMessages(state.internalMessages) : state.internalMessages,
+        state.lastMessage || null,
+        instruction,
       );
 
     // Real-time phase announcement: the subagent sees, as a reasoning delta BEFORE the upstream
@@ -353,12 +439,29 @@ export class SubagentOrchestrator {
       result = await runWith(phasePrompt(true));
     }
 
-    state.phaseResults[agentId] = result.content ?? '';
+    state.lastUsage = result.usage ?? null;
     state.totalUpstreamCalls += 1;
+    // Client-delegated compaction: the REAL upstream usage says the context is at/over the
+    // threshold — interrupt. No phase result is stored (the next call will pre-block), and the
+    // subagent receives a pause notice; the parent re-emits the pending spawn until the client
+    // compacts and resumes (resume() then adopts the compacted pile and clears the flag).
+    if (contextFull(result.usage, state.context_window_size, this.compactThreshold)) {
+      state.compactPending = true;
+      this.logger.warn(
+        `subagent phase: phase=${phase} agent_id=${agentId} ${Date.now() - t0}ms context at ` +
+        `${result.usage?.prompt_tokens}/${state.context_window_size} tokens (>= ${Math.round(this.compactThreshold * 100)}%) — ` +
+        `interrupting; the client will compact and the ${phase} phase will resume with the compacted context`,
+      );
+      if (args.sink) {
+        args.sink.emitReasoningDelta(0, `[${phase}] context compaction threshold reached — waiting for the client to compact\n`);
+      }
+      return { content: COMPACT_PENDING_NOTICE, reasoning: result.reasoning ?? '', usage: result.usage ?? null, compactPending: true };
+    }
+    state.phaseResults[agentId] = result.content ?? '';
     this.logger.info(
       `subagent phase: phase=${phase} agent_id=${agentId} ${Date.now() - t0}ms output_len=${(result.content ?? '').length}`,
     );
-    return { content: result.content ?? '', reasoning: result.reasoning ?? '' };
+    return { content: result.content ?? '', reasoning: result.reasoning ?? '', usage: result.usage ?? null, compactPending: false };
   }
 
   /** Mint the agent id, build the envelope + prompt and return the spawn ToolCall (R3).
@@ -379,6 +482,21 @@ export class SubagentOrchestrator {
       `orchestrator spawn: phase=${envelope.phase} round=${state.round} agent_id=${agentId} tool=${spec.toolName} type=${state.activeTypeId || spec.typeId}`,
     );
     return toolCall;
+  }
+
+  /** The phase instruction a delegated phase would run (estimate/bookkeeping only). */
+  private phaseInstructionFor(state: LoopStateData): string {
+    const stage = state.stage;
+    switch (stage) {
+      case 'planify':
+        return buildPlanifyInstruction(goalHintForPlanify(state.originalInstruction, state.lastOutput));
+      case 'execute':
+        return state.task?.description ?? state.originalInstruction;
+      case 'evaluate':
+        return buildEvaluateInstruction(state.originalInstruction);
+      default:
+        return '';
+    }
   }
 
   /**

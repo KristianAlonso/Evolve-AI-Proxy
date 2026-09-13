@@ -65,20 +65,6 @@ export function buildEvaluateInstruction(originalInstruction: string): string {
   ].join('\n');
 }
 
-/**
- * Context-window guard (SC-021 / SC-022), re-implemented on top of the A-008 canonical shape.
- * The proxy stays proactively below the upstream window so `ContextWindowExceeded` is PREVENTED,
- * never hit: when the estimated prompt size crosses 75% of the window, the prompt is shrunk
- * progressively — first the intermediate `assistant` turn is capped, then the OLDEST middle
- * base messages are condensed to short markers (their role and tool_calls/tool_call_id structure
- * are preserved so the conversation stays valid for the API; the first message, the newest
- * exchange and the phase instruction always travel intact).
- * `windowSize <= 0` = unlimited: the prompt travels untouched and the upstream decides (SC-022).
- */
-const CONDENSE_THRESHOLD = 0.75; // SC-021
-const CONDENSED_MARKER = ' [... condensed to fit the context window]';
-const INTERMEDIATE_TRUNCATED_MARKER = ' [... truncated to fit the context window]';
-
 /** Rough token estimate for a prompt (~4 chars per token, same heuristic as the capture interceptor). */
 export function estimatePromptTokens(messages: UpstreamMessage[]): number {
   let chars = 0;
@@ -89,49 +75,51 @@ export function estimatePromptTokens(messages: UpstreamMessage[]): number {
   return Math.ceil(chars / 4);
 }
 
-/** Cap `messages` so its estimated size stays within `windowSize` (no-op when `windowSize <= 0`). */
-export function fitToContextWindow(messages: UpstreamMessage[], windowSize: number): UpstreamMessage[] {
-  if (!(windowSize > 0)) return messages;
-  const budgetChars = Math.floor(windowSize * CONDENSE_THRESHOLD) * 4;
-  if (estimatedChars(messages) <= budgetChars) return messages;
-
-  const out = messages.map((m) => ({ ...m }));
-
-  // 1) Cap the intermediate assistant turn (second-to-last, before the appended instruction).
-  const intermediateIdx =
-    out.length >= 2 && out[out.length - 2].role === 'assistant' ? out.length - 2 : -1;
-  if (intermediateIdx !== -1) {
-    const content = typeof out[intermediateIdx].content === 'string' ? out[intermediateIdx].content : '';
-    if (content.length > budgetChars) {
-      out[intermediateIdx] = {
-        ...out[intermediateIdx],
-        content: content.slice(0, budgetChars) + INTERMEDIATE_TRUNCATED_MARKER,
-      };
-    }
-  }
-
-  // 2) Condense the oldest middle messages (keep the first message, the last 3, and the marker).
-  if (estimatedChars(out) > budgetChars && out.length > 5) {
-    const end = out.length - 3; // last 3 always intact (newest exchange + instruction)
-    for (let i = 1; i < end; i++) {
-      const m = out[i];
-      const content = typeof m.content === 'string' ? m.content : JSON.stringify(m.content ?? '');
-      if (content.length > 160) {
-        out[i] = { ...m, content: content.slice(0, 160) + CONDENSED_MARKER };
-      }
-    }
-  }
-
-  return out;
+/**
+ * Context-compaction threshold (client-delegated compaction). The proxy NEVER truncates, cuts or
+ * condenses messages: when the REAL upstream usage of a call shows the context at or beyond
+ * `threshold` (fraction, e.g. 0.9) of the known window, the loop is interrupted and the compaction
+ * is delegated to the client — the client compacts its own conversation (its request is passed
+ * through as-is) and resumes, and the proxy adopts the new (compacted) context, discarding the
+ * old messages entirely. `windowSize <= 0` (unknown window) disables the check (SC-022):
+ * the upstream decides and any `ContextWindowExceeded` is still fail-fast (no retries).
+ */
+export function contextFull(
+  usage: { prompt_tokens?: number } | null | undefined,
+  windowSize: number,
+  threshold: number,
+): boolean {
+  if (!(windowSize > 0) || !usage) return false;
+  return (usage.prompt_tokens ?? 0) >= windowSize * threshold;
 }
 
-function estimatedChars(messages: UpstreamMessage[]): number {
-  let chars = 0;
+/**
+ * Notice returned (instead of a real phase result) while the loop waits for the client's
+ * compaction: the phase is paused, no upstream call is made, and no phase result is stored —
+ * the pending spawn is re-emitted (stable agent_id) until the compacted context arrives.
+ */
+export const COMPACT_PENDING_NOTICE =
+  'Agent loop paused: the conversation context has reached the compaction threshold. The client will ' +
+  'compact its conversation history; when it resumes, the pending phase will continue with the ' +
+  'compacted context. No further work is produced in this session.';
+
+/**
+ * Detects a client-initiated context-compaction request (e.g. OpenCode's pre-compaction summary
+ * call): a single user message whose content embeds the conversation to be summarized. The proxy
+ * passes these requests through to the upstream untouched — no agent loop, no orchestrator, no
+ * phase bookkeeping — and the response (the summary) goes back to the client as-is.
+ */
+export function isCompactionRequest(messages: UpstreamMessage[]): boolean {
+  // Only the most recent user message can be a compaction request (the conversation rides verbatim
+  // inside it).
+  let lastUser: string | null = null;
   for (const m of messages) {
-    chars += typeof m.content === 'string' ? m.content.length : JSON.stringify(m.content ?? '').length;
-    if (m.tool_calls && m.tool_calls.length > 0) chars += JSON.stringify(m.tool_calls).length;
+    if (m.role === 'user') lastUser = typeof m.content === 'string' ? m.content : JSON.stringify(m.content ?? '');
   }
-  return chars;
+  if (lastUser === null) return false;
+  // OpenCode: "Here is the conversation so far:" + "Create a new anchored summary ...". The
+  // Stainless SDK helper (Anthropic path) says "Write a continuation summary ...". Match both.
+  return /here is the conversation so far/i.test(lastUser) || /continuation summary|anchored summary/i.test(lastUser);
 }
 
 /**

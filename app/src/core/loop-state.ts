@@ -7,7 +7,7 @@
 //
 // Every field must be plain JSON (SessionStore serializes it for TTL bookkeeping).
 
-import type { AgentTask, ContextStep, LoopDecision, ToolChoice, ToolDefinition, UpstreamMessage } from '../types.js';
+import type { AgentTask, ContextStep, LoopDecision, TokenUsage, ToolChoice, ToolDefinition, UpstreamMessage } from '../types.js';
 import type { Interpretation } from './interpreter.js';
 import type { SubagentSpawnSpec } from './subagent-spawn.js';
 
@@ -50,11 +50,20 @@ export interface LoopStateData {
    */
   lastMessage: string;
   /**
-   * Resolved upstream context window (tokens). 0 = unlimited: phase prompts travel untouched
-   * (SC-022). When > 0 each phase prompt is capped proactively at 75% of it BEFORE the upstream
-   * call, so `ContextWindowExceeded` is prevented (SC-021), never hit.
+   * Resolved upstream context window (tokens). 0 = unknown/unlimited: the proxy never checks the
+   * compaction threshold and the upstream decides (SC-022). When > 0 the loop is interrupted at
+   * `CONTEXT_COMPACT_THRESHOLD` fraction of it (client-delegated compaction).
    */
   context_window_size: number;
+  /**
+   * Client-delegated compaction: set when a phase call's real upstream usage hit the compaction
+   * threshold. While set, every new phase call is pre-blocked (no upstream call, notice only)
+   * and the pending spawn is re-emitted until the client's compacted context arrives on the next
+   * parent resume (which refreshes `internalMessages`, clears the flag and re-emits the phase).
+   */
+  compactPending: boolean;
+  /** Real upstream usage of the last delegated call (relay to the client for its token tracking). */
+  lastUsage: TokenUsage | null;
   /** ADR A-008 / R1: sticky — once the upstream rejects the structured conversation (4xx), every
    *  later phase of this session uses the rendered (flat) base. */
   fellBackToRendered: boolean;
@@ -94,6 +103,8 @@ export function newLoopState(args: {
     lastOutput: '',
     lastMessage: '',
     context_window_size: args.context_window_size ?? 0,
+    compactPending: false,
+    lastUsage: null,
     fellBackToRendered: false,
     accumulatedSteps: [],
     phaseResults: {},

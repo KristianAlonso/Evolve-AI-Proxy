@@ -115,19 +115,44 @@ donde:
 
 ## Refinimientos (post-implementación inicial)
 
-1. **Control de ventana de contexto (SC-021/SC-022) — `fitToContextWindow`**
-   (`phase-prompts.ts`), aplicado a TODA llamada de fase (inline y delegada) ANTES de
-   salir, para que el `ContextWindowExceeded` se *previene*, nunca se pilla:
-   - Estimación de tokens ≈ chars/4 (misma heurística del interceptador de capturas);
-     presupuesto = **75 %** de `context_window_size` (umbral SC-021).
-   - Reducción progresiva: (1) topa el turno `assistant` intermedio (2.º desde el final)
-     si excede el presupuesto; (2) condensa los mensajes viejos de la base a marcadores
-     cortos — siempre íntegros: primer mensaje, los últimos 3 y la instrucción de fase; se
-     conserva rol y estructura `tool_calls`/`tool_call_id` para que la conversación siga
-     siendo válida para la API.
-   - `context_window_size = 0` (desconocida) = sin límite: el prompt sale intacto y el
-     upstream decide (SC-022). El campo vuelve a `LoopStateData` para sobrevivir la
-     serialización del parent-resume.
+1. **Compaction de contexto delegada al cliente (SC-021/SC-022)** — sustituye a la
+   `fitToContextWindow` (reducción/condensado) implementada en la primera pasada: el proxy
+   NUNCA trunca, corta ni condensa mensajes. En su lugar, la compaction la hace el
+   **cliente** (p. ej. OpenCode) y el proxy actúa de detector + passthrough + reanudador:
+   - **Detección**: tras cada llamada upstream de fase (interpret/planify/execute/evaluate,
+     inline y delegada) se compara el `usage` REAL (`prompt_tokens`) contra
+     `context_window_size × CONTEXT_COMPACT_THRESHOLD` (`contextFull()` en
+     `phase-prompts.ts`; umbral por env, por defecto 0.9). `context_window_size = 0`
+     (desconocida) = sin check: el upstream decide (SC-022) y el
+     `ContextWindowExceeded` sigue siendo fail-fast (sin reintentos).
+   - **Interrupción**: al alcanzar el umbral se rompe la secuencia sin más llamadas
+     (`LoopDecision = 'context_compact_pending'`; en el orquestador, la bandera
+     `state.compactPending` sobrevive el parent-resume). La fase interrumpida NO guarda
+     resultado; en su lugar se emite `COMPACT_PENDING_NOTICE` como `final_output`.
+   - **Pre-bloqueo**: mientras `compactPending` está puesto, cada nueva petición de fase
+     se responde con el notice **sin llamada upstream** (evita el `ContextWindowExceeded`
+     en el intento siguiente).
+   - **Relevo de `usage`**: el `usage` real de la última llamada se incluye en el finish
+     chunk SSE (nivel raíz del JSON, junto a `choices`) y en la respuesta JSON
+     (`toOpenAICompletion`), para que el cliente haga su propio tracking de tokens por
+     mensaje (OpenCode comprime cuando `input+output` del último mensaje ≥ ventana
+     efectiva). Sin este relevo el tracking del cliente nunca vería el contexto crecer.
+   - **Passthrough de compaction**: la petición de compaction del cliente (detectada por
+     `isCompactionRequest()`: marcador de OpenCode/Stainless en el último mensaje `user`)
+     pasa **intacta** al upstream — sin agent loop, sin orquestador, sin bookkeeping de
+     fases; la respuesta (el resumen) vuelve igual. Se intercepta ANTES de la
+     tri-partición de `routes.ts` (también la de un subagente, cuyo `x-session-id` lo
+     haría encajar en la rama de subagente).
+   - **Reanudación**: la siguiente petición (contexto compactado) refresca
+     `state.internalMessages` desde el montón entrante — se descartan por completo los
+     mensajes viejos —, limpia `compactPending`/`lastMessage`, descarta el notice
+     pendiente y re-emite la fase interrumpida. Si el contexto sigue ≥ umbral se repite
+     el ciclo con el mismo `agent_id` (spawn estable); si ya está bajo, `agent_id` nuevo.
+     En el bucle inline (sin estado persistido) la reanudación es un `AgentLoop.run()`
+     fresco: el interpret re-deriva el objetivo (degradación aceptable; OpenCode siempre
+     usa el camino delegado, que tiene `tools`).
+   - El estado de la compaction vive en `LoopStateData` (`compactPending`, `lastUsage`)
+     para sobrevivir la serialización del parent-resume.
 2. **Anuncio de fase en tiempo real** — antes de cada llamada upstream de fase, el cliente
    recibe un delta de razonamiento `[fase] <qué va a hacer>` (interpret/planify/execute/
    evaluate, tanto inline como delegadas; execute incluye la descripción de la tarea).

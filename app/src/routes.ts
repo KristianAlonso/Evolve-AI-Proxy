@@ -32,7 +32,8 @@ import { SubagentOrchestrator, type OrchestratorOutcome, type SubagentBinding } 
 import { newLoopState, type LoopStateData } from './core/loop-state.js';
 import { detectTypeDrift, isSubagentContinuation, parseSubagentEnvelope } from './core/subagent-spawn.js';
 import { mapSubagentTool } from './core/subagent-mapper.js';
-import { accumulatedSummary, toInternalMessages } from './core/phase-prompts.js';
+import { accumulatedSummary, isCompactionRequest, toInternalMessages } from './core/phase-prompts.js';
+import { callWithStreaming } from './core/stream-helper.js';
 import env from './config.js';
 
 /**
@@ -56,6 +57,10 @@ function finishReason(decision: LoopDecision): { reason: string; refused: boolea
     // FASE 2: the client executes the delegated tools and resumes the conversation.
     case 'tool_calls_pending':
       return { reason: 'tool_calls', refused: false };
+    // Context full: the loop was interrupted so the CLIENT compacts its own context. The
+    // response is a normal assistant turn (a short pause notice), then the client resumes.
+    case 'context_compact_pending':
+      return { reason: 'stop', refused: false };
     default:
       return { reason: 'error', refused: true };
   }
@@ -80,7 +85,9 @@ function toOpenAICompletion(model: string, finalResult: FinalResultData, traceId
         finish_reason: reason,
       },
     ],
-    usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
+    // REAL upstream usage of the loop's last call (the client tracks context occupancy from it
+    // and triggers its own compaction at its threshold) — zeros only when no call ever ran.
+    usage: finalResult.usage ?? { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
     meta: {
       agent_decision: finalResult.decision,
       iterations_completed: finalResult.iterations_completed,
@@ -154,9 +161,15 @@ class SinkAdapter implements LoopSink {
   }
 }
 
-/** Finalize an AI-compatible stream: emit a terminal finish chunk for the loop decision (SC-018). */
-function finalizeAiStream(writer: SseWriter, decision: LoopDecision): void {
-  writer.emitAiFinish(finishReason(decision).reason);
+/** Finalize an AI-compatible stream: emit a terminal finish chunk for the loop decision (SC-018).
+ *  `usage` carries the REAL upstream token accounting into the finish frame so the client's
+ *  per-message token tracking (and its compaction trigger) works. */
+function finalizeAiStream(
+  writer: SseWriter,
+  decision: LoopDecision,
+  usage?: { prompt_tokens: number; completion_tokens: number; total_tokens: number },
+): void {
+  writer.emitAiFinish(finishReason(decision).reason, usage);
 }
 
 export interface CreateAppOptions {
@@ -339,6 +352,7 @@ export async function createApp(options: CreateAppOptions = {}): Promise<Fastify
       traceId,
       abort_signal: abortController.signal,
       passthrough,
+      compact_threshold: env.CONTEXT_COMPACT_THRESHOLD,
     };
     log.info(`loop configured: max_rounds=${loopOpts.max_rounds} max_retries=${loopOpts.max_retries} context_window=${loopOpts.context_window_size}`);
 
@@ -369,6 +383,50 @@ export async function createApp(options: CreateAppOptions = {}): Promise<Fastify
     //      inline agent loop below — the fail-safe that guarantees no request ever breaks.
     // Everything else (no tools, FASE 2 native delegation, standalone chats) is served by the
     // classic inline agent loop exactly as before.
+    // ---- Client-delegated context compaction: the client's OWN compaction request is a plain
+    // upstream passthrough ("como si nada") — no loop, no orchestrator, no session bookkeeping.
+    // The upstream reply (the summary) becomes the client's new context; its NEXT request resumes
+    // the interrupted phase (orchestrator compactPending branch / fresh inline loop).
+    if (isCompactionRequest(messages)) {
+      log.info(`compaction request: model="${concreteModel}" stream=${!!body.stream} messages=${messages.length} — pure passthrough to upstream`);
+      if (body.stream) {
+        const writer = new SseWriter(reply as unknown as FastifyReply, log);
+        const { result } = await callWithStreaming({
+          provider,
+          model: concreteModel,
+          messages,
+          options: { logger: log, trace_id: traceId, abort_signal: abortController.signal, passthrough },
+          surfaceDelta: (chunk) => {
+            const reasoning = typeof chunk.reasoning === 'string' ? chunk.reasoning : '';
+            const content = typeof chunk.content === 'string' ? chunk.content : '';
+            if (reasoning !== '') writer.emitAiReasoningDelta(0, reasoning);
+            if (content !== '') writer.emitAiContent(0, content);
+          },
+        });
+        finalizeAiStream(writer, 'complete', result.usage);
+        reply.raw.write('data: [DONE]\n\n');
+        reply.raw.end();
+      } else {
+        const { result } = await callWithStreaming({
+          provider,
+          model: concreteModel,
+          messages,
+          options: { logger: log, trace_id: traceId, abort_signal: abortController.signal, passthrough },
+        });
+        reply.send({
+          id: `chatcmpl-${Date.now().toString(36)}`,
+          object: 'chat.completion',
+          created: Math.floor(Date.now() / 1000),
+          model: concreteModel,
+          choices: [{ index: 0, message: { role: 'assistant', content: result.content ?? '' }, finish_reason: 'stop' }],
+          usage: result.usage ?? { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
+          meta: { compaction: true, trace_id: traceId },
+        });
+      }
+      log.info(`request done (compaction passthrough): stream=${!!body.stream} elapsed=${Date.now() - requestStart}ms`);
+      return;
+    }
+
     const envelope = parseSubagentEnvelope(messages);
     let subagentUpdate: { parentSessionId: string; agentId: string } | null = null;
 
@@ -440,7 +498,7 @@ export async function createApp(options: CreateAppOptions = {}): Promise<Fastify
           log.warn(`orchestrator resume: type drift detected but remap failed — keeping previous spec (type="${previousType}")`);
         }
       }
-      const orchestrator = new SubagentOrchestrator(provider, log);
+      const orchestrator = new SubagentOrchestrator(provider, log, loopOpts.compact_threshold);
       // The parent's pile already holds the consumed phase result (as the spawn tool's result):
       // the orchestrator refreshes its base from it (ADR A-008 delegated flow).
       const outcome = orchestrator.resume(session.loopState, sessionId, messages);
@@ -454,7 +512,7 @@ export async function createApp(options: CreateAppOptions = {}): Promise<Fastify
         } else {
           sink.emitContent(0, outcome.finalOutput);
         }
-        finalizeAiStream(writer, outcome.decision);
+        finalizeAiStream(writer, outcome.decision, outcome.usage ?? undefined);
         reply.raw.write('data: [DONE]\n\n');
         reply.raw.end();
         log.info(`request done (orchestrator resume, stream): decision=${outcome.decision} frames=${writer.frames} elapsed=${Date.now() - requestStart}ms`);
@@ -481,7 +539,7 @@ export async function createApp(options: CreateAppOptions = {}): Promise<Fastify
         context_window_size: loopOpts.context_window_size,
       });
       let writerRef: SseWriter | undefined;
-      const started = await new SubagentOrchestrator(provider, log).start({
+      const started = await new SubagentOrchestrator(provider, log, loopOpts.compact_threshold).start({
         state,
         sessionId,
         model: concreteModel,
@@ -508,7 +566,7 @@ export async function createApp(options: CreateAppOptions = {}): Promise<Fastify
           } else {
             sink.emitContent(0, outcome.finalOutput);
           }
-          finalizeAiStream(writerRef, outcome.decision);
+          finalizeAiStream(writerRef, outcome.decision, outcome.usage ?? undefined);
           reply.raw.write('data: [DONE]\n\n');
           reply.raw.end();
           log.info(`request done (orchestrator start, stream): decision=${outcome.decision} frames=${writerRef.frames} elapsed=${Date.now() - requestStart}ms`);
@@ -601,14 +659,14 @@ async function handleSubagentPhase(params: {
   passthrough?: Record<string, unknown>;
 }): Promise<void> {
   const { reply, log, traceId, model, stream, abort_signal, provider, state, binding } = params;
-  const orchestrator = new SubagentOrchestrator(provider, log);
+  const orchestrator = new SubagentOrchestrator(provider, log, env.CONTEXT_COMPACT_THRESHOLD);
   const start = Date.now();
   try {
     if (stream) {
       const writer = new SseWriter(reply, log);
       const sink = new SinkAdapter(writer);
       const out = await orchestrator.runSubagentPhase({ state, binding, model, tools: params.tools, tool_choice: params.tool_choice, sink, traceId, abort_signal, passthrough: params.passthrough });
-      finalizeAiStream(writer, 'complete');
+      finalizeAiStream(writer, 'complete', out.usage ?? undefined);
       reply.raw.write('data: [DONE]\n\n');
       reply.raw.end();
       log.info(`subagent phase done (stream): phase=${binding.phase} agent_id=${binding.agentId} output_len=${out.content.length} frames=${writer.frames} elapsed=${Date.now() - start}ms`);
@@ -620,8 +678,8 @@ async function handleSubagentPhase(params: {
         created: Math.floor(Date.now() / 1000),
         model,
         choices: [{ index: 0, message: { role: 'assistant', content: out.content }, finish_reason: 'stop' }],
-        usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
-        meta: { subagent_phase: binding.phase, agent_id: binding.agentId, trace_id: traceId },
+        usage: out.usage ?? { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
+        meta: { subagent_phase: binding.phase, agent_id: binding.agentId, compact_pending: out.compactPending, trace_id: traceId },
       });
       log.info(`subagent phase done: phase=${binding.phase} agent_id=${binding.agentId} output_len=${out.content.length} elapsed=${Date.now() - start}ms`);
     }
@@ -798,7 +856,7 @@ async function handleStream(
   try {
     // Extract the final decision off the loop result so we can emit a matching finish chunk.
     const result = await runLoop(provider, sink, opts, messages, instruction);
-    finalizeAiStream(writer, result.decision);
+    finalizeAiStream(writer, result.decision, result.usage);
     // Flush the terminating frame on the same socket as every other stream frame — Fastify would
     // drop `reply.send` here just like any later `send`, so [DONE] must go out via raw.write.
     reply.raw.write('data: [DONE]\n\n');

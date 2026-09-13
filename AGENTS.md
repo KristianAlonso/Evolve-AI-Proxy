@@ -60,7 +60,7 @@ Toda llamada upstream de una fase del bucle (inline u orquestador) usa **una sol
 
 - El `system` del cliente se conserva byte a byte; el proxy **nunca añade `system`** — las instrucciones de fase van al final como `user`.
 - **Solo se conserva el último mensaje intermedio** (la salida cruda de la última fase, un único turno `assistant`); el historial de fases anterior se descarta — sin `ContextManager`.
-- **Control de ventana de contexto (SC-021/SC-022)**: cada llamada de fase pasa por `fitToContextWindow` (presupuesto 75 % de `context_window_size`; reduce primero el turno intermedio y luego condensa los mensajes viejos de la base; `0` = sin límite).
+- **Compaction de contexto delegada al cliente (SC-021/SC-022)**: el proxy NUNCA trunca ni condensa mensajes. Tras cada llamada upstream compara el `usage` real contra `context_window_size × CONTEXT_COMPACT_THRESHOLD` (env, por defecto 0.9; `context_window_size = 0` = sin check, el upstream decide). Al alcanzar el umbral: se interrumpe el bucle sin más llamadas (`context_compact_pending`), se **relee el `usage` real** al cliente (finish chunk SSE + JSON, para su tracking de tokens), la petición de compaction del cliente pasa **intacta** (passthrough puro, sin loop ni orquestador) y la siguiente petición adopta el contexto compactado — se descartan los mensajes viejos del estado y la fase interrumpida se re-emite (spawn estable mismo `agent_id` mientras el contexto siga lleno).
 - **Anuncio de fase en tiempo real**: antes de cada fase (inline o delegada) el cliente recibe un delta de razonamiento `[fase] <qué va a hacer>` (wire 100 % OpenAI).
 - **Flujo delegado**: la salida de cada fase la persiste el cliente como tool result; `resume()` refresca la base desde el montón entrante del padre y limpia `lastMessage` (solo el raw del interpret viaja como intermedio propio).
 - Inline (`AgentLoop`) y orquestador (`SubagentOrchestrator`, FASE 6) comparten los mismos builders; el fallback sticky estructur→rendered (4xx) se aplica a todas las fases.
@@ -97,7 +97,7 @@ evolve_ai_proxy/
   <ISO timestamp> [<LEVEL>] <session-id o -> <trace-id o -> <mensaje>
   ```
 
-- **Cada operación deja una línea**: request recibido, resolución de modelo, configuración del loop, cada fase del agent loop (interpret/plan/execute/evaluate/condense) con duración, cada llamada upstream (request/response con latencia, tokens, tool_calls), delegación de tools, errores y fin del request. Para auditar un request: `grep <trace_id> logs/evolve-proxy-*.log`.
+- **Cada operación deja una línea**: request recibido, resolución de modelo, configuración del loop, cada fase del agent loop (interpret/plan/execute/evaluate) con duración, cada llamada upstream (request/response con latencia, tokens, tool_calls), delegación de tools, errores y fin del request. Para auditar un request: `grep <trace_id> logs/evolve-proxy-*.log`.
 - Los loggers se crean por request con `createLogger('http').traced(traceId)`; el logger viaja con las opciones de llamada (`ProviderCallOptions.logger`) para que hasta un provider singleton loguee bajo el trace correcto.
 - El logger NUNCA crashea un request: cualquier fallo de escritura se descarta.
 - **Consola en vivo**: cada línea se espeja también a stdout (error/warn a stderr) cuando `CONSOLE_LOG=true` (por defecto; `CONSOLE_LOG=false` para silenciar). Un hook `onRequest` loguea **toda** conexión entrante al instante: `incoming: <ip> <METHOD> <endpoint> (HTTP/<versión>)` con su `trace_id`.

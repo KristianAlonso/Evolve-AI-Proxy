@@ -25,7 +25,7 @@ export async function interpretRequest(
   messages: UpstreamMessage[],
   options?: { model: string | null; logger?: TraceLogger; traceId?: string; abort_signal?: AbortSignal; passthrough?: Record<string, unknown> },
   emitter?: LiveEmitter,
-): Promise<{ interpretation: Interpretation; reasoning: string; raw: string; streamed: boolean }> {
+): Promise<{ interpretation: Interpretation; reasoning: string; raw: string; streamed: boolean; usage: NormalizedResult['usage'] }> {
   // Single shared call (FASE 1): stream live reasoning deltas when an emitter is attached, and
   // buffer otherwise. Structured `content` here is internal JSON that gets parsed into a trace below,
   // so only the thinking path surfaces on the wire — emitting it as assistant text would corrupt the
@@ -49,7 +49,7 @@ export async function interpretRequest(
   const parsed = safeJsonParse(text);
   if (!parsed) {
     // Fall back to treating the whole thing as the main objective.
-    return { interpretation: { mainObjective: text, subObjectives: [], resourcesNeeded: [] }, reasoning: result.reasoning, raw, streamed };
+    return { interpretation: { mainObjective: text, subObjectives: [], resourcesNeeded: [] }, reasoning: result.reasoning, raw, streamed, usage: result.usage };
   }
 
   const mainObjective = String(parsed.mainObjective ?? text).slice(0, 500);
@@ -65,6 +65,7 @@ export async function interpretRequest(
     reasoning: result.reasoning,
     raw,
     streamed,
+    usage: result.usage,
   };
 }
 

@@ -14,7 +14,7 @@ Proxy AI OpenAI-compatible con bucle agéntico iterativo, streaming en tiempo re
 (ADR A-003) contra cualquier upstream OpenAI-compatible (LiteLLM, Ollama, LM Studio, Groq, …):
 
 ```text
-request → Interpretar → Planificar → Ejecutar → Evaluar → (condensar contexto) → repetir
+request → Interpretar → Planificar → Ejecutar → Evaluar → repetir
           hasta: complete | tool_calls_pending | max_rounds | error
 ```
 
@@ -33,7 +33,13 @@ request → Interpretar → Planificar → Ejecutar → Evaluar → (condensar c
   `AbortController` cancela la llamada upstream **en vuelo** (no se generan tokens para un cliente
   muerto) y el bucle se detiene sin reintentos.
 - **Safety** — auto-healing con reintentos (falla rápido en errores deterministas: contexto
-  excedido, auth, 4xx), detección de doom-loops, control de ventanas de contexto.
+  excedido, auth, 4xx), detección de doom-loops.
+- **Compaction de contexto delegada al cliente** — el proxy NUNCA trunca ni condensa mensajes:
+  tras cada llamada upstream compara el `usage` real contra `context_window_size x umbral`
+  (`CONTEXT_COMPACT_THRESHOLD`, por defecto 0.9). Al llegar al umbral interrumpe el bucle, relee
+  el `usage` real (SSE final chunk + JSON) para que el cliente haga su propio tracking de tokens,
+  deja pasar la petición de compaction del cliente intacta y, en la siguiente petición, adopta el
+  contexto compactado (descartando los mensajes viejos) y reanuda la fase interrumpida.
 - **Passthrough-intacto** (ADR A-007) — el upstream recibe la petición del cliente verbatim
   (`temperature`, `top_p`, `seed`, `top_k`, `stop`, `logprobs`, `response_format`, `user`,
   `metadata`, …). Solo `messages` (inyección de fase) y `model` (alias) se transforman.
@@ -127,6 +133,7 @@ Todas definidas en `app/src/config.ts` (y `logger.ts`), con su valor por defecto
 | `CONSOLE_LOG` | `true` | Espejar cada línea de log a stdout/stderr. |
 | `CAPTURE_DIR` | `./captures` | Directorio de capturas (request entrante + `upstream/`). |
 | `CAPTURE_REQUESTS` | `true` | Habilitar capturas JSON a disco. |
+| `CONTEXT_COMPACT_THRESHOLD` | `0.9` | Fracción de `context_window_size` (usage real) a la que se interrumpe el bucle y se delega la compaction al cliente. |
 | `FORCE_COLOR` | *(off)* | Forzar color ANSI aunque la salida no sea TTY. |
 | `NO_COLOR` | *(off)* | Desactivar color ANSI aunque sea TTY. |
 

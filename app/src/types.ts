@@ -137,7 +137,11 @@ export type LoopDecision =
   // The upstream model requested client-side tool calls; the proxy delegated them to the client
   // and pauses. The client executes the tools and resumes by re-sending the conversation
   // (assistant tool_calls + tool results) on the same session (FASE 2).
-  | 'tool_calls_pending';
+  | 'tool_calls_pending'
+  // The context reached the compaction threshold (prompt usage >= threshold x window): the loop
+  // is interrupted — no further upstream call — and the client is expected to compact its
+  // conversation and resume (the proxy passes the compaction request through as-is).
+  | 'context_compact_pending';
 
 /** Options passed from the orchestrator down into a provider call. */
 export interface CallOptions {

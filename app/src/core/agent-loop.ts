@@ -3,11 +3,12 @@
 // evaluate binary decision -> (context condensing) -> repeat until complete or max_rounds.
 // Emits typed SSE events through a LoopSink; results are also returned for the non-stream path.
 
+import env from '../config.js';
 import { isAbortError } from '../provider/types.js';
 import type { ChatProvider } from '../provider/types.js';
 import { createLogger, type TraceLogger } from '../logger.js';
 import type { Phase, SSEEvent } from '../sse-writer.js';
-import type { AgentTask, ContextStep, LoopDecision, TaskResult, ToolCall, ToolChoice, ToolDefinition, UpstreamMessage } from '../types.js';
+import type { AgentTask, ContextStep, LoopDecision, TaskResult, TokenUsage, ToolCall, ToolChoice, ToolDefinition, UpstreamMessage } from '../types.js';
 import { interpretRequest, type Interpretation } from './interpreter.js';
 import { generateTasks } from './task-generator.js';
 import { evaluateTask } from './evaluator.js';
@@ -18,7 +19,8 @@ import {
   buildEvaluateInstruction,
   buildPhasePrompt,
   buildPlanifyInstruction,
-  fitToContextWindow,
+  COMPACT_PENDING_NOTICE,
+  contextFull,
   goalHintForPlanify,
   INTERPRET_INSTRUCTION,
   isStructuredRejection,
@@ -46,6 +48,9 @@ export interface LoopOptions {
   max_retries?: number; // SC-013
   doom_loop_threshold?: number; // SC-012
   context_window_size: number; // SC-022
+  /** Fraction of the context window at which the loop is interrupted and compaction is delegated
+   *  to the client (default: env CONTEXT_COMPACT_THRESHOLD). Requires context_window_size > 0. */
+  compact_threshold?: number;
   model?: string | null;
   /** Client-side tools to delegate (FASE 2). Only the execute step sees them — interpretation,
    *  planning and evaluation keep their internal structured prompts tool-free. */
@@ -91,6 +96,9 @@ export interface FinalResultData {
   accumulated_context: string;
   /** Tool calls delegated to the client when the decision is 'tool_calls_pending' (FASE 2). */
   tool_calls: ToolCall[];
+  /** Real upstream usage of this run (last call's prompt = current context size) — relayed to the
+   *  client so it can track tokens and trigger its own context compaction. */
+  usage?: TokenUsage;
 }
 
 /** One self-contained execution attempt inside the auto-healing wrapper. */
@@ -99,6 +107,7 @@ type ExecStep = () => Promise<{
   reasoning: string;
   doomedLoop: DoomLoopResult;
   tool_calls: ToolCall[];
+  usage?: TokenUsage;
 }>;
 
 export class AgentLoop {
@@ -193,6 +202,12 @@ export class AgentLoop {
           `interpret (round ${round + 1}): ${Date.now() - interpT0}ms objective="${interp.interpretation.mainObjective.replace(/\s+/g, ' ').slice(0, 160)}" ` +
           `sub_objectives=${interp.interpretation.subObjectives.length} resources=${interp.interpretation.resourcesNeeded.length}`,
         );
+        // Client-delegated compaction: if the interpret call's real usage is already at/over the
+        // threshold, the planify/execute prompts (same base) would only overflow — stop here.
+        if (this.contextFullNow(interp.usage, loopConfig)) {
+          decision = 'context_compact_pending';
+          break;
+        }
 
         // ---- Initial task generation from the interpretation (SC-005). ----
         let tasks = await generateTasks(this.provider, originalInstruction, interp.interpretation);
@@ -209,6 +224,12 @@ export class AgentLoop {
         }
         this.logger.info(`plan (round ${round + 1}): ${Date.now() - planT0}ms task="${task.description.replace(/\s+/g, ' ').slice(0, 160)}"`);
         trace.push({ iteration: round + 1, phase: 'planning', task_id: task.id, content: task.description });
+
+        // The planify call (when it ran) saw the same base as the upcoming execute — check before it.
+        if (this.contextFullNow(undefined, loopConfig)) {
+          decision = 'context_compact_pending';
+          break;
+        }
 
         // ---- Execute with auto-healing + doom-loop guard (SC-012/013/014). ----
         this.emitPhase('executing_task', { step: `execute #${round + 1}` });
@@ -229,7 +250,8 @@ export class AgentLoop {
           // No watcher, or a provider without completeStream (unit-test stubs): fully buffered call.
           if (!this.sink) {
             const res = await this.provider.complete(loopConfig.model, this.phasePrompt(rendered, taskContent), callOptions);
-            return { output: res.content ?? '', reasoning: res.reasoning || '', doomedLoop: { detected: false, repetitions: 0 }, tool_calls: res.tool_calls };
+            this.lastUsage = res.usage;
+            return { output: res.content ?? '', reasoning: res.reasoning || '', doomedLoop: { detected: false, repetitions: 0 }, tool_calls: res.tool_calls, usage: res.usage };
           }
 
           // ---- Streaming attempt: stream live thinking + detect a runaway while it generates. ----
@@ -262,7 +284,8 @@ export class AgentLoop {
             },
           });
 
-          return { output: (result.content ?? ''), reasoning: result.reasoning || '', doomedLoop: lastDoomed, tool_calls: result.tool_calls };
+          this.lastUsage = result.usage;
+          return { output: (result.content ?? ''), reasoning: result.reasoning || '', doomedLoop: lastDoomed, tool_calls: result.tool_calls, usage: result.usage };
         };
 
         let outcome;
@@ -283,6 +306,12 @@ export class AgentLoop {
           `output_len=${outcome.result.output.length} heal_retries=${outcome.traces.length} ` +
           `doom_loop=${outcome.doomedLoop.detected}`,
         );
+        // The execute call carried the FULL client pile — its real usage is the authoritative
+        // context-occupancy measure before the evaluate call.
+        if (this.contextFullNow(undefined, loopConfig)) {
+          decision = 'context_compact_pending';
+          break;
+        }
 
         const result: TaskResult = outcome.result;
         if (result.status === 'failed') {
@@ -354,6 +383,11 @@ export class AgentLoop {
         );
         this.lastMessage = evalCall.raw || null;
         this.logger.info(`evaluate (round ${round + 1}): ${Date.now() - evalT0}ms decision=${evalCall.decision}`);
+        if (evalCall.decision !== 'complete' && this.contextFullNow(evalCall.usage, loopConfig)) {
+          // Not done yet, but the next round's interpret would overflow: pause for client compaction.
+          decision = 'context_compact_pending';
+          break;
+        }
         if (this.sink) {
           if (evalCall.streamed) {
             // The "why" already arrived as live deltas; only append the binary decision marker.
@@ -398,7 +432,9 @@ export class AgentLoop {
     );
 
     const finalResult: FinalResultData = {
-      final_output: lastOutput || '',
+      // A loop interrupted for client-side compaction replies with a short pause notice (the real
+      // work resumes after the client compacts its context and re-sends the request).
+      final_output: decision === 'context_compact_pending' ? COMPACT_PENDING_NOTICE : lastOutput || '',
       iterations_completed: accumulatedSteps.length,
       decision,
       max_rounds: loopConfig.max_rounds,
@@ -410,6 +446,7 @@ export class AgentLoop {
       },
       accumulated_context: this.accumulatedSummary(accumulatedSteps),
       tool_calls: pendingToolCalls,
+      usage: this.lastUsage,
     };
 
     if (this.sink) this.sink.emitPhase('completed', { final_output_length: lastOutput.length });
@@ -422,6 +459,7 @@ export class AgentLoop {
       max_retries: this.opts.max_retries ?? 3, // SC-013
       doom_loop_threshold: this.opts.doom_loop_threshold ?? 4, // SC-012
       context_window_size: this.opts.context_window_size ?? 4096, // SC-022
+      compact_threshold: this.opts.compact_threshold ?? env.CONTEXT_COMPACT_THRESHOLD,
       model: this.opts.model ?? null,
       tools: this.opts.tools,
       tool_choice: this.opts.tool_choice,
@@ -436,6 +474,28 @@ export class AgentLoop {
   private countCall(tag: string): void {
     this.totalUpstreamCalls += 1;
     this.logger.debug(`upstream call (${tag}): total=${this.totalUpstreamCalls}`);
+  }
+
+  /** Real usage of the last upstream call of this run (relayed to the client for its token tracking). */
+  private lastUsage: TokenUsage | undefined;
+
+  /**
+   * Client-delegated compaction checkpoint: remember the latest real usage and report whether the
+   * context is at/over `context_window_size x compact_threshold`. The caller breaks the loop with
+   * decision 'context_compact_pending' when true — no message is ever truncated or condensed.
+   */
+  private contextFullNow(usage: TokenUsage | undefined, loopConfig: ReturnType<AgentLoop['resolvedOptions']>): boolean {
+    if (usage) this.lastUsage = usage;
+    if (contextFull(this.lastUsage, loopConfig.context_window_size, loopConfig.compact_threshold)) {
+      this.logger.warn(
+        `context compaction threshold reached: prompt=${this.lastUsage?.prompt_tokens} tokens >= ` +
+        `${Math.round(loopConfig.context_window_size * loopConfig.compact_threshold)} ` +
+        `(window=${loopConfig.context_window_size} x ${loopConfig.compact_threshold}) — ` +
+        `interrupting the loop; the client will compact its context and can resume`,
+      );
+      return true;
+    }
+    return false;
   }
 
   private emitPhase(phase: Phase, extra?: Record<string, unknown>): void {
@@ -492,6 +552,7 @@ export class AgentLoop {
       }),
     );
     // ADR A-008: the planify reply becomes the process' last intermediate message.
+    this.lastUsage = result.usage;
     this.lastMessage = (result.content ?? '').trim() || null;
     const desc = (result.content ?? '').trim() || `Follow up on: ${goalHint.slice(0, 120)}`;
     return { id: `task-refine-${Date.now()}`, description: desc, context_needed: [] };
@@ -502,11 +563,11 @@ export class AgentLoop {
    * intermediate message as a single `assistant` turn, the instruction appended at the end (user).
    */
   private phasePrompt(rendered: boolean, instruction: string): UpstreamMessage[] {
-    // SC-021: stay proactively within the resolved upstream window before every upstream call.
-    return fitToContextWindow(
-      buildPhasePrompt(rendered ? this.renderedInternal : this.structuredInternal, this.lastMessage, instruction),
-      this.opts.context_window_size ?? 4096,
-    );
+    // ADR A-008: the prompt travels UNTOUCHED — never truncated, cut or condensed. Context control
+    // is reactive and client-delegated: after each upstream call the REAL usage is compared
+    // against `context_window_size x compact_threshold` and the loop is interrupted (the client
+    // compacts its own context and resumes) instead of the proxy mutating the conversation.
+    return buildPhasePrompt(rendered ? this.renderedInternal : this.structuredInternal, this.lastMessage, instruction);
   }
 
   /**

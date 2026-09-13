@@ -143,7 +143,12 @@ export class SseWriter {
    * a `choices` array, so the choice delta plus an optional terminal `finishReason` is exactly
    * what must be produced — no proprietary frame may ever reach the wire here.
    */
-  public emitAiChunk(choice: { index: number; delta: Record<string, unknown>; finishReason?: string }): void {
+  public emitAiChunk(
+    choice: { index: number; delta: Record<string, unknown>; finishReason?: string },
+    /** Optional REAL token usage for the finish frame — the client (opencode) tracks context
+     *  occupancy from it and triggers its own compaction. */
+    usage?: { prompt_tokens: number; completion_tokens: number; total_tokens: number },
+  ): void {
     this.frames++;
     const payload = JSON.stringify({
       id: this.id,
@@ -155,6 +160,7 @@ export class SseWriter {
           ? { index: choice.index, delta: choice.delta, finish_reason: choice.finishReason }
           : { index: choice.index, delta: choice.delta },
       ],
+      ...(usage ? { usage } : {}),
     });
     // No `event:` line — only a bare `data:` block. OpenAI-compatible clients (opencode, the Vercel
     // AI SDK) validate every data frame as a chat-completion chunk and reject any that lacks
@@ -200,9 +206,10 @@ export class SseWriter {
     });
   }
 
-  /** OpenAI-compatible finish chunk: empty delta, `finish_reason` set (SC-018). */
-  public emitAiFinish(finishReason: string): void {
-    this.emitAiChunk({ index: 0, delta: {}, finishReason });
+  /** OpenAI-compatible finish chunk: empty delta, `finish_reason` set (SC-018).
+   *  Accepts the real upstream usage so the client can track tokens per message. */
+  public emitAiFinish(finishReason: string, usage?: { prompt_tokens: number; completion_tokens: number; total_tokens: number }): void {
+    this.emitAiChunk({ index: 0, delta: {}, finishReason }, usage);
   }
 
   /** Notify that the client disconnected mid-flight so callers can abort (SC-023). */

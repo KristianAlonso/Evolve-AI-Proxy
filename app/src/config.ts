@@ -20,6 +20,10 @@ export interface Env {
   CAPTURE_DIR: string;
   /** Whether to capture incoming requests to disk at all. */
   CAPTURE_REQUESTS: boolean;
+  /** Fraction of the upstream context window (0..1) at which the loop is interrupted and context
+   *  compaction is delegated to the client (it compacts and resumes; the proxy never truncates).
+   *  Requires `context_window_size > 0` on the request to take effect. */
+  CONTEXT_COMPACT_THRESHOLD: number;
 }
 
 const env: Env = {
@@ -33,6 +37,12 @@ const env: Env = {
   CONSOLE_LOG: (process.env.CONSOLE_LOG ?? 'true') === 'true',
   CAPTURE_DIR: process.env.CAPTURE_DIR ?? './captures',
   CAPTURE_REQUESTS: (process.env.CAPTURE_REQUESTS ?? 'true') === 'true',
+  CONTEXT_COMPACT_THRESHOLD: clamp01(Number(process.env.CONTEXT_COMPACT_THRESHOLD ?? 0.9)),
 };
+
+/** Clamp an env-provided threshold into [0, 1] (invalid values fall back to 0.9). */
+function clamp01(v: number): number {
+  return Number.isFinite(v) && v >= 0 && v <= 1 ? v : 0.9;
+}
 
 export default env;
