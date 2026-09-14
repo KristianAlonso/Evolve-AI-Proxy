@@ -12,6 +12,7 @@ Registro de decisiones arquitecturales que han dado forma al diseño y la evoluc
 | [A-006](./a-006-subagent-phase-delegation.md) | Delegación de Fases a Subagentes | **Aceptada** | Las fases planificar/ejecutar/evaluar se delegan al cliente vía tool call de spawn (formato OpenAI estándar); estado serializable en `SessionStore`; degradación segura al bucle inline. |
 | [A-007](./a-007-passthrough-intacto.md) | Passthrough-Intacto de la Petición | **Aceptada** | El proxy reenvía al upstream la petición del cliente verbatim (salvo `messages` y `model`); sin valores inventados (eliminan los `max_tokens` forzados 512/128/8192); campos estándar mapeados a opciones v4, el resto via `providerOptions` raw del SDK. |
 | [A-008](./a-008-phase-prompt-shaping.md) | Phase-Prompt Shaping | **Aceptada** | Toda llamada upstream de fase usa una forma canónica: conversación del cliente intacta (sin `system` añadidos) + el último mensaje intermedio (un turno `assistant`) + la instrucción de fase al final (`user`). Elimina el `ContextManager` y la acumulación de contexto; inline y orquestador comparten la misma forma. |
+| [A-009](./a-009-passthrough-sin-tools.md) | Passthrough de Peticiones sin Tools | **Aceptada** | Toda petición sin `tools` (auxiliares del cliente, p. ej. el title-generator de OpenCode) es passthrough puro: 1 llamada upstream, messages intactos, sin tocas el `SessionStore`. Evita que un bucle inline sobre una petición auxiliar borre la `loopState` del padre y reinicie el flujo delegado. |
 
 ## Formato de los ADRs
 

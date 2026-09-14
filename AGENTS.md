@@ -66,6 +66,14 @@ Toda llamada upstream de una fase del bucle (inline u orquestador) usa **una sol
 - Inline (`AgentLoop`) y orquestador (`SubagentOrchestrator`, FASE 6) comparten los mismos builders; el fallback sticky estructur→rendered (4xx) se aplica a todas las fases.
 - Detalle: [docs/adr/a-008-phase-prompt-shaping.md](./docs/adr/a-008-phase-prompt-shaping.md)
 
+### A-009: Passthrough de Peticiones sin Tools
+
+Toda petición **sin `tools`** que no sea compaction se sirve como **passthrough puro** (misma rama/función que la compaction): 1 llamada upstream con los `messages` intactos, respuesta SSE/JSON según el cliente, y **sin tocar el `SessionStore`** (no crea, no salva, no borra). La rama se evalúa **antes** de la tri-partición FASE 6.
+
+- **Por qué**: las peticiones auxiliares del cliente (p. ej. el *title-generator* de OpenCode, que reutiliza el `x-session-id` del padre) caían antes en el bucle inline: 3–4 llamadas upstream (~4 min) por un título, y al completar **boraban la sesión** (`store.delete`) — borrando la `loopState` del orquestador en curso y forzando un reinicio completo del flujo (nuevo interpret + fase repetida + re-prefill de ~31K tokens en el upstream local).
+- El bucle inline queda reservado a peticiones **con tools**: fail-safe del mapeo del orquestador (FASE 6) y delegación nativa FASE 2.
+- Detalle: [docs/adr/a-009-passthrough-sin-tools.md](./docs/adr/a-009-passthrough-sin-tools.md)
+
 ## Estructura de carpetas (provisional)
 
 ```text
@@ -148,5 +156,5 @@ Además del bucle inline, el proxy puede **delegar las fases planificar/ejecutar
 | [README.md](./README.md) | Documentación completa del proxy (arquitectura, streaming, FASE 6, configuración) |
 | [LICENSE.md](./LICENSE.md) | Apache 2.0 |
 | [CONTRIBUTING.md](./CONTRIBUTING.md) | No existe |
-| [docs/adr/index.md](./docs/adr/index.md) | Índice de decisiones arquitecturales (A-001…A-008) |
+| [docs/adr/index.md](./docs/adr/index.md) | Índice de decisiones arquitecturales (A-001…A-009) |
 | [plans/subagent-phase-delegation.md](./plans/subagent-phase-delegation.md) | Plan FASE 6 — Delegación de fases a subagentes |

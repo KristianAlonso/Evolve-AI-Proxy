@@ -309,6 +309,12 @@ export class SubagentOrchestrator {
         }
         // The consumed result already lives in the parent's pile (the spawn tool's result):
         // refresh the base from the incoming conversation and drop our intermediate copy.
+        // NOTE (A-006): the subagent's SPWN prompt (envelope + task description) is
+        // informational for the client only and is NEVER sent to the LLM. The LLM prompt
+        // for the NEXT phase is rebuilt from the PARENT's incoming pile
+        // (state.internalMessages, refreshed here with the consumed phase result) +
+        // state.lastMessage + the next phase instruction — i.e. the orchestrator's own
+        // phase instruction and the parent's history, NOT the subagent's initial message.
         state.lastMessage = '';
         if (incomingMessages && incomingMessages.length > 0) {
           state.internalMessages = toInternalMessages(incomingMessages);
@@ -365,6 +371,15 @@ export class SubagentOrchestrator {
     // ADR A-008: delegated phases use the SAME single shape as the inline loop — client base
     // verbatim + the last intermediate message (one `assistant` turn) + the instruction (user,
     // appended at the end). No system message is ever added.
+    //
+    // NOTE (subagent phase, A-006): the subagent's OWN spawn prompt — the envelope JSON +
+    // the task description the proxy put in the ToolCall (`spawnTaskDescription`) — is
+    // INFORMATIONAL FOR THE CLIENT ONLY and is NEVER sent to the LLM. The LLM prompt for
+    // this phase is built here from the PARENT's stored history (state.internalMessages) +
+    // the process' last intermediate message (state.lastMessage) + the phase instruction
+    // (user, appended at the end). The orchestrator already knows what this phase must
+    // do (the phase instruction + the parent's message history + its own internal
+    // messages); it does NOT depend on the subagent's initial message.
     let instruction: string;
     switch (phase) {
       case 'planify':

@@ -383,47 +383,36 @@ export async function createApp(options: CreateAppOptions = {}): Promise<Fastify
     //      inline agent loop below — the fail-safe that guarantees no request ever breaks.
     // Everything else (no tools, FASE 2 native delegation, standalone chats) is served by the
     // classic inline agent loop exactly as before.
-    // ---- Client-delegated context compaction: the client's OWN compaction request is a plain
-    // upstream passthrough ("como si nada") — no loop, no orchestrator, no session bookkeeping.
-    // The upstream reply (the summary) becomes the client's new context; its NEXT request resumes
-    // the interrupted phase (orchestrator compactPending branch / fresh inline loop).
-    if (isCompactionRequest(messages)) {
-      log.info(`compaction request: model="${concreteModel}" stream=${!!body.stream} messages=${messages.length} — pure passthrough to upstream`);
-      if (body.stream) {
-        const writer = new SseWriter(reply as unknown as FastifyReply, log);
-        const { result } = await callWithStreaming({
-          provider,
-          model: concreteModel,
-          messages,
-          options: { logger: log, trace_id: traceId, abort_signal: abortController.signal, passthrough },
-          surfaceDelta: (chunk) => {
-            const reasoning = typeof chunk.reasoning === 'string' ? chunk.reasoning : '';
-            const content = typeof chunk.content === 'string' ? chunk.content : '';
-            if (reasoning !== '') writer.emitAiReasoningDelta(0, reasoning);
-            if (content !== '') writer.emitAiContent(0, content);
-          },
-        });
-        finalizeAiStream(writer, 'complete', result.usage);
-        reply.raw.write('data: [DONE]\n\n');
-        reply.raw.end();
-      } else {
-        const { result } = await callWithStreaming({
-          provider,
-          model: concreteModel,
-          messages,
-          options: { logger: log, trace_id: traceId, abort_signal: abortController.signal, passthrough },
-        });
-        reply.send({
-          id: `chatcmpl-${Date.now().toString(36)}`,
-          object: 'chat.completion',
-          created: Math.floor(Date.now() / 1000),
-          model: concreteModel,
-          choices: [{ index: 0, message: { role: 'assistant', content: result.content ?? '' }, finish_reason: 'stop' }],
-          usage: result.usage ?? { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
-          meta: { compaction: true, trace_id: traceId },
-        });
-      }
-      log.info(`request done (compaction passthrough): stream=${!!body.stream} elapsed=${Date.now() - requestStart}ms`);
+    // ---- Pure passthrough requests ("como si nada", ADR A-007/A-009): one upstream call with
+    // the client's messages untouched — no loop, no orchestrator, NO session reads or writes.
+    // Two kinds:
+    //   * the client's OWN context-compaction request. The upstream reply (the summary) becomes
+    //     the client's new context; its NEXT request resumes the interrupted phase (orchestrator
+    //     compactPending branch / fresh inline loop).
+    //   * requests WITHOUT client tools (ADR A-009): auxiliary client calls (session-title
+    //     generation, etc.) and plain standalone chats. They must NOT run the agent loop:
+    //     without tools the loop has nothing to execute, it only multiplies upstream calls —
+    //     and a completing inline loop would delete the shared session, wiping the parent's
+    //     loopState and forcing the whole flow to restart (observed with OpenCode's title
+    //     generator, which reuses the parent session id). This branch runs BEFORE the
+    //     envelope/loopState routing for exactly that reason.
+    const hasTools = !!body.tools && body.tools.length > 0;
+    if (isCompactionRequest(messages) || !hasTools) {
+      const kind = isCompactionRequest(messages) ? 'compaction' : 'no-tools';
+      log.info(`${kind} request: model="${concreteModel}" stream=${!!body.stream} messages=${messages.length} — pure passthrough to upstream`);
+      await servePurePassthrough({
+        provider,
+        model: concreteModel,
+        messages,
+        stream: !!body.stream,
+        reply: reply as unknown as FastifyReply,
+        log,
+        traceId,
+        abort_signal: abortController.signal,
+        passthrough,
+        meta: kind === 'compaction' ? { compaction: true, trace_id: traceId } : { passthrough: 'no_tools', trace_id: traceId },
+      });
+      log.info(`request done (${kind} passthrough): stream=${!!body.stream} elapsed=${Date.now() - requestStart}ms`);
       return;
     }
 
@@ -613,6 +602,58 @@ export async function createApp(options: CreateAppOptions = {}): Promise<Fastify
   });
 
   return app;
+}
+
+/**
+ * Pure passthrough ("como si nada"): one upstream call with the client's messages untouched;
+ * the reply goes back as-is (SSE if the client streamed, JSON if not). No agent loop, no
+ * orchestrator, and — critically — no session reads or writes: auxiliary client calls that
+ * share a session id (e.g. OpenCode's title generator) must never create, save or delete
+ * loop state.
+ */
+async function servePurePassthrough(params: {
+  provider: ChatProvider;
+  model: string;
+  messages: UpstreamMessage[];
+  stream: boolean;
+  reply: FastifyReply;
+  log: TraceLogger;
+  traceId: string;
+  abort_signal: AbortSignal;
+  passthrough?: Record<string, unknown>;
+  meta: Record<string, unknown>;
+}): Promise<void> {
+  const { provider, model, messages, stream, reply, log, traceId, abort_signal, passthrough, meta } = params;
+  const options = { logger: log, trace_id: traceId, abort_signal, passthrough };
+  if (stream) {
+    const writer = new SseWriter(reply as unknown as FastifyReply, log);
+    const { result } = await callWithStreaming({
+      provider,
+      model,
+      messages,
+      options,
+      surfaceDelta: (chunk) => {
+        const reasoning = typeof chunk.reasoning === 'string' ? chunk.reasoning : '';
+        const content = typeof chunk.content === 'string' ? chunk.content : '';
+        if (reasoning !== '') writer.emitAiReasoningDelta(0, reasoning);
+        if (content !== '') writer.emitAiContent(0, content);
+      },
+    });
+    finalizeAiStream(writer, 'complete', result.usage);
+    reply.raw.write('data: [DONE]\n\n');
+    reply.raw.end();
+  } else {
+    const { result } = await callWithStreaming({ provider, model, messages, options });
+    reply.send({
+      id: `chatcmpl-${Date.now().toString(36)}`,
+      object: 'chat.completion',
+      created: Math.floor(Date.now() / 1000),
+      model,
+      choices: [{ index: 0, message: { role: 'assistant', content: result.content ?? '' }, finish_reason: 'stop' }],
+      usage: result.usage ?? { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
+      meta,
+    });
+  }
 }
 
 /**
@@ -911,24 +952,16 @@ function buildPassthrough(body: Record<string, unknown>): Record<string, unknown
 }
 
 /**
- * Build the natural-language instruction for the loop: the full system prompt (all `system`
- * turns, in order) followed by the first `user` turn's content. The agent must act on both —
- * never drop the system context, and never run without a concrete user instruction.
+ * The natural-language instruction for the loop: the FIRST `user` turn's content.
+ *
+ * `originalInstruction` is the USER's instruction (the "Hola", the task, the goal) — NOT the
+ * system prompt. The system prompt (opencode's "montón", AGENTS.md, skills, swarm context)
+ * already travels in `state.internalMessages` (the parent's message history); it must NOT be
+ * duplicated into `originalInstruction`. The phase instructions (planify/execute/evaluate)
+ * are built from `originalInstruction` alone, so it must be the user's message only.
  */
 function firstText(messages: UpstreamMessage[]): string {
-  const system = messages
-    .filter((m) => m.role === 'system' && typeof m.content === 'string')
-    .map((m) => m.content)
-    .join('\n');
-  const user = messages.find(
-    (m) => m.role === 'user' && typeof m.content === 'string',
-  )?.content;
-
-  // Validation guarantees at least one system OR user message exists, so this is never empty in
-  // practice. Prefer the explicit system prompt when present (it defines *how* to act), and fall
-  // back to the first available turn's content if it is missing.
-  if (system && user) return `${system}\n\n${user}`;
-  return system || user || '';
+  return messages.find((m) => m.role === 'user' && typeof m.content === 'string')?.content ?? '';
 }
 
 /**
