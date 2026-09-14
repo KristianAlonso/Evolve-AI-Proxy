@@ -196,8 +196,14 @@ export function toRenderedMessages(messages: UpstreamMessage[]): UpstreamMessage
  * Heuristic: did the upstream reject the STRUCTURED conversation shape (so the rendered fallback
  * is worth trying) rather than a real content/policy failure? Deliberately broad but anchored on
  * 4xx + shape/role vocabulary; aborts never match (callers exclude them explicitly).
+ *
+ * Transport failures (connection refused/reset, timeouts, socket errors) are NEVER a structured
+ * rejection — nothing is listening to render-fallback to. They are matched explicitly and
+ * excluded first; the status codes are word-bounded so a port number (e.g. the upstream on
+ * `:4000`) can't masquerade as an HTTP 400 in the message text.
  */
 export function isStructuredRejection(err: unknown): boolean {
   const text = String(err);
-  return /400|422|invalid|malformed|schema|unexpected|role|thought_signature|context/i.test(text);
+  if (/ECONNREFUSED|ECONNRESET|ETIMEDOUT|EPIPE|fetch failed/i.test(text)) return false;
+  return /\b(400|422)\b|invalid|malformed|schema|unexpected|role|thought_signature|context/i.test(text);
 }

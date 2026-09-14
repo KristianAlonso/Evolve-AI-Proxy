@@ -11,6 +11,7 @@
 // so the assertions inspect EXACTLY what the proxy would have sent upstream.
 
 import { describe, it, expect } from 'vitest';
+import { isStructuredRejection } from '../core/phase-prompts.js';
 import { AgentLoop, type LoopOptions } from '../core/agent-loop.js';
 import { SubagentOrchestrator } from '../core/orchestrator.js';
 import { stub, type StubRecord } from './stub-provider.js';
@@ -21,6 +22,19 @@ import type { SubagentSpawnSpec } from '../core/subagent-spawn.js';
 import type { UpstreamMessage } from '../types.js';
 
 const SYSTEM = 'You are a helpful assistant working on this project.';
+
+describe('isStructuredRejection', () => {
+  it('matches 4xx shape rejections, not transport errors — and not port numbers (e.g. upstream on :4000)', () => {
+    expect(isStructuredRejection(new Error('HTTP 400 Bad Request: invalid role'))).toBe(true);
+    expect(isStructuredRejection(new Error('422 Unprocessable Entity: schema validation failed'))).toBe(true);
+    expect(isStructuredRejection(new Error('AI_APICallError: thought_signature missing in assistant turn'))).toBe(true);
+    // Transport failures: nothing is listening to render-fallback to (observed live: the ECONNREFUSED
+    // text carries the upstream port 4000, which the old /400/ regex matched as an HTTP status).
+    expect(isStructuredRejection(new Error('AI_APICallError: Cannot connect to API: connect ECONNREFUSED 26.238.135.219:4000'))).toBe(false);
+    expect(isStructuredRejection(new Error('AI_APICallError: fetch failed'))).toBe(false);
+    expect(isStructuredRejection(new Error('AI_APICallError: socket hang up (ECONNRESET)'))).toBe(false);
+  });
+});
 
 const clientMessages = (): UpstreamMessage[] => [
   { role: 'system', content: SYSTEM },

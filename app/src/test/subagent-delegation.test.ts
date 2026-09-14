@@ -377,6 +377,9 @@ describe('subagent orchestrator', () => {
     const args = JSON.parse(outcome.toolCall!.function.arguments) as Record<string, unknown>;
     expect(outcome.toolCall!.function.name).toBe('task');
     const env = JSON.parse(String(args.prompt).split('\n', 1)[0]) as SpawnEnvelope;
+    // The delegation gate of clients like OpenCode+opencode-swarm blocks any dispatch without a
+    // non-empty ACCEPTANCE line — the spawn prompt must carry one (per-stage, in the task part).
+    expect(String(args.prompt)).toMatch(/ACCEPTANCE: DONE when/);
     expect(env.phase).toBe('planify');
     expect(env.parent_session_id).toBe('ses_parent_1');
     expect(state.pendingAgentId).toBe(env.agent_id);
@@ -421,6 +424,11 @@ describe('subagent orchestrator', () => {
     expect(state.stage).toBe('execute');
     expect(state.task!.description).toBe('Take a concrete step');
 
+    // Every spawn (every stage) carries the ACCEPTANCE line required by client delegation gates.
+    const spawnPrompt = (out: OrchestratorOutcome): string =>
+      String(JSON.parse(out.toolCall!.function.arguments).prompt);
+    expect(spawnPrompt(out1)).toMatch(/ACCEPTANCE: DONE when/); // execute
+
     // execute consumed -> evaluate with the accumulated step
     const execAgentId = state.pendingAgentId!;
     state.phaseResults[execAgentId] = 'Output A';
@@ -430,6 +438,7 @@ describe('subagent orchestrator', () => {
     expect(state.lastOutput).toBe('Output A');
     expect(state.accumulatedSteps.length).toBe(1);
     expect(state.accumulatedSteps[0].output).toBe('Output A');
+    expect(spawnPrompt(out2)).toMatch(/ACCEPTANCE: DONE when/); // evaluate
 
     // evaluate "continue" with round < max_rounds -> next round planify
     const evalAgentId = state.pendingAgentId!;
@@ -438,6 +447,7 @@ describe('subagent orchestrator', () => {
     expect(out3.kind).toBe('tool_call');
     expect(state.stage).toBe('planify');
     expect(state.round).toBe(2);
+    expect(spawnPrompt(out3)).toMatch(/ACCEPTANCE: DONE when/); // planify (round 2)
 
     // Walk round 2 quickly: planify -> execute -> evaluate(complete) -> final.
     const deliver = (content: string) => {
@@ -533,6 +543,86 @@ describe('subagent orchestrator', () => {
     const second = orchestrator.resume(state, 'ses_parent_1');
     expect(second.toolCall!.id).toBe('spawn_agent-only');
     expect(state.spawnRetries).toBe(2);
+  });
+
+  it('resume(): adopts the phase result from the parent pile when the client executed the spawn itself (strict tool_call_id, plugin-agnostic)', () => {
+    const orchestrator = new SubagentOrchestrator(stub(), log);
+    const state = makeState();
+    state.pendingAgentId = 'agent-p1';
+
+    // The client (with a middle plugin — e.g. opencode-swarm — or a native subagent runner) never
+    // routed the subagent through the proxy; the spawn's result comes back as an ordinary
+    // `tool` message in the parent's incoming pile, preserving the spawn ToolCall id.
+    const pile: UpstreamMessage[] = [
+      { role: 'system', content: 'sys', reasoning: '', tool_calls: [] },
+      { role: 'user', content: 'Do the thing', reasoning: '', tool_calls: [] },
+      {
+        role: 'assistant',
+        content: '',
+        reasoning: '',
+        tool_calls: [{ id: 'spawn_agent-p1', type: 'function', function: { name: 'task', arguments: '{}' } }],
+      },
+      { role: 'tool', tool_call_id: 'spawn_agent-p1', tool_name: 'task', content: 'Take a concrete step', reasoning: '', tool_calls: [] },
+    ];
+
+    const out = orchestrator.resume(state, 'ses_parent_1', pile);
+    expect(out.kind).toBe('tool_call');
+    expect(state.stage).toBe('execute'); // consumed, machine advanced
+    expect(state.task!.description).toBe('Take a concrete step');
+    expect(state.spawnRetries).toBe(0); // a real result arrived — no failover
+    expect(state.activeTypeId).toBe('plan'); // type pinned (no rotation)
+    expect(state.pendingAgentId).not.toBe('agent-p1'); // consumed
+  });
+
+  it('resume(): loose adoption for clients that re-mint tool ids (first tool message after the spawn turn)', () => {
+    const orchestrator = new SubagentOrchestrator(stub(), log);
+    const state = makeState();
+    state.pendingAgentId = 'agent-p2';
+
+    const pile: UpstreamMessage[] = [
+      { role: 'user', content: 'Do the thing', reasoning: '', tool_calls: [] },
+      {
+        role: 'assistant',
+        content: '',
+        reasoning: '',
+        tool_calls: [{ id: 'spawn_agent-p2', type: 'function', function: { name: 'task', arguments: '{}' } }],
+      },
+      // The client re-minted the tool_call_id — no strict match, but this is the first tool
+      // message after the spawn turn.
+      { role: 'tool', tool_call_id: 'client-reminted-123', tool_name: 'task', content: 'Loose step', reasoning: '', tool_calls: [] },
+    ];
+
+    orchestrator.resume(state, 'ses_parent_1', pile);
+    expect(state.stage).toBe('execute');
+    expect(state.task!.description).toBe('Loose step');
+    expect(state.spawnRetries).toBe(0);
+
+    // STALE results must NOT be adopted: a tool message that belongs to an EARLIER spawn (before
+    // the pending one) is ignored, and a missing result still fails over.
+    const state2 = makeState();
+    state2.pendingAgentId = 'agent-p3';
+    const pileStale: UpstreamMessage[] = [
+      { role: 'user', content: 'Do the thing', reasoning: '', tool_calls: [] },
+      {
+        role: 'assistant',
+        content: '',
+        reasoning: '',
+        tool_calls: [{ id: 'spawn_agent-OLD', type: 'function', function: { name: 'task', arguments: '{}' } }],
+      },
+      { role: 'tool', tool_call_id: 'spawn_agent-OLD', tool_name: 'task', content: 'STALE old result', reasoning: '', tool_calls: [] },
+      {
+        role: 'assistant',
+        content: '',
+        reasoning: '',
+        tool_calls: [{ id: 'spawn_agent-p3', type: 'function', function: { name: 'task', arguments: '{}' } }],
+      },
+      // …and nothing after the pending spawn: the client never answered it.
+    ];
+
+    orchestrator.resume(state2, 'ses_parent_1', pileStale);
+    expect(state2.stage).toBe('planify'); // unchanged — failover fired
+    expect(state2.pendingAgentId).not.toBe('agent-p3'); // rotated fresh agent id
+    expect(state2.activeTypeId).toBe('build'); // rotated type
   });
 
   it('resume(): after a drift re-mapping (new spec + activeTypeId), spawns use the new type', () => {

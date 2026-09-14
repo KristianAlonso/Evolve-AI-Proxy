@@ -224,7 +224,22 @@ export class SubagentOrchestrator {
       }
 
       const agentId = state.pendingAgentId;
-      const phaseResult = agentId ? state.phaseResults[agentId] : undefined;
+      let phaseResult = agentId ? state.phaseResults[agentId] : undefined;
+      if (agentId && phaseResult === undefined && incomingMessages && incomingMessages.length > 0) {
+        // Plugin-agnostic adoption: the client may have executed the spawn inside ITSELF (native
+        // subagent runner, or a middle plugin — e.g. opencode-swarm — without the subagent ever
+        // talking to the proxy). The result then arrives as an ordinary `tool` message in the
+        // parent's incoming pile. Adopt it as the phase result; see findSpawnResultInPile.
+        const adopted = this.findSpawnResultInPile(agentId, incomingMessages);
+        if (adopted !== undefined) {
+          state.phaseResults[agentId] = adopted;
+          phaseResult = adopted;
+          this.logger.info(
+            `orchestrator resume: phase result for agent_id=${agentId} adopted from the parent conversation ` +
+            `(client-executed spawn, ${adopted.length} chars, stage=${state.stage} round=${state.round})`,
+          );
+        }
+      }
       if (agentId && phaseResult === undefined) {
         // The subagent's phase result has not arrived: the client has not run the subagent (its
         // plugin blocked the dispatch, or it errored out). Rounds only advance once the parent
@@ -515,6 +530,44 @@ export class SubagentOrchestrator {
   }
 
   /**
+   * Plugin-agnostic phase-result adoption: recognize the pending spawn's result inside the
+   * parent's incoming conversation using ONLY the OpenAI wire format — no knowledge of (or
+   * dependence on) any client plugin, envelope, or custom marker:
+   *   1. STRICT — a `tool` message whose `tool_call_id` matches the spawn ToolCall id this
+   *      orchestrator emitted (`spawn_<agent_id>`; the client must preserve tool call ids).
+   *   2. LOOSE — clients that re-mint tool ids: the first `tool` message that follows the
+   *      last assistant turn carrying tool_calls (that turn is the spawn the proxy emitted,
+   *      so the first tool answer after it is the spawn's result).
+   * Whatever the content is, it IS the phase result: if a middle plugin blocked the dispatch,
+   * the client sees that error in its own conversation — the proxy stays transparent.
+   */
+  private findSpawnResultInPile(agentId: string, messages: UpstreamMessage[]): string | undefined {
+    const spawnId = `spawn_${agentId}`;
+    for (let i = messages.length - 1; i >= 0; i--) {
+      const m = messages[i];
+      if (m.role !== 'tool') continue;
+      const id = m.tool_call_id ?? '';
+      if (id === spawnId || id === agentId || id.endsWith(agentId)) {
+        return typeof m.content === 'string' ? m.content : '';
+      }
+    }
+    let lastAssistantTcIndex = -1;
+    for (let i = 0; i < messages.length; i++) {
+      const m = messages[i];
+      if (m?.role === 'assistant' && m.tool_calls && m.tool_calls.length > 0) {
+        lastAssistantTcIndex = i;
+      }
+    }
+    for (let i = lastAssistantTcIndex + 1; i < messages.length; i++) {
+      const m = messages[i];
+      if (m?.role === 'tool') {
+        return typeof m.content === 'string' ? m.content : '';
+      }
+    }
+    return undefined;
+  }
+
+  /**
    * Failover: the NEXT subagent type in round-robin over `spec.availableTypes` (wraps to the
    * first after the last). Null when at most one type is available — then there is nothing to
    * rotate to and the orchestrator keeps re-emitting the same spawn (stable).
@@ -527,7 +580,16 @@ export class SubagentOrchestrator {
     return types[next].id;
   }
 
-  /** The "current task" description that rides in the spawn prompt (after the envelope line). */
+  /** The "current task" description that rides in the spawn prompt (after the envelope line).
+   *
+   * Every stage ends with a one-line `ACCEPTANCE:` statement of what DONE looks like for the
+   * phase. Client-side delegation gates (e.g. OpenCode + opencode-swarm's knowledge-gate) block
+   * any dispatch without a non-empty ACCEPTANCE line and return the error instantly as the
+   * tool result — which the orchestrator would then see as "no phase result" and fail over
+   * forever (observed live: planify cycling through coder/critic/… with 0.7 s no-op resumes).
+   * The line is plain prompt text: harmless to clients without a gate, mandatory to the ones
+   * with one.
+   */
   private spawnTaskDescription(state: LoopStateData): string {
     switch (state.stage) {
       case 'planify':
@@ -535,14 +597,19 @@ export class SubagentOrchestrator {
           `Goal: "${state.originalInstruction}"`,
           `Latest result so far:\n${state.lastOutput || '(none)'}`,
           'Propose the next single concrete task that moves toward the goal.',
+          'ACCEPTANCE: DONE when the reply is exactly the next single concrete task and nothing else (no commentary, no preamble).',
         ].join('\n\n');
       case 'execute':
-        return state.task?.description ?? state.originalInstruction;
+        return [
+          state.task?.description ?? state.originalInstruction,
+          'ACCEPTANCE: DONE when the reply is exactly the raw result of performing the task (or the exact output the task asks for) and nothing else.',
+        ].join('\n\n');
       case 'evaluate':
         return [
           `Original instruction: "${state.originalInstruction}"`,
           `Latest task result:\n${state.lastOutput || '(none)'}`,
           'Decide whether the goal has been fully met.',
+          'ACCEPTANCE: DONE when the reply is exactly the evaluation of whether the goal has been fully met (JSON or a single line) and nothing else.',
         ].join('\n\n');
       default:
         return state.originalInstruction;

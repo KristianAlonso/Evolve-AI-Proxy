@@ -338,7 +338,9 @@ export async function createApp(options: CreateAppOptions = {}): Promise<Fastify
     // the proxy itself transforms (messages/model/stream/tools/tool_choice) or owns (evolve
     // controls) — rides verbatim into EVERY upstream call (loop phases, subagent phases, the
     // mapper). No invented defaults, no dropped parameters.
-    const passthrough = buildPassthrough(body);
+    const rawSessionId = request.headers['x-session-id'];
+    const sessionId = typeof rawSessionId === 'string' && rawSessionId.length > 0 ? rawSessionId : undefined;
+    const passthrough = buildPassthrough(body, sessionId);
 
     const loopOpts: LoopOptions = {
       max_rounds: body.max_rounds ?? 10,
@@ -363,10 +365,6 @@ export async function createApp(options: CreateAppOptions = {}): Promise<Fastify
     // loop work runs — we therefore always reach here with an actionable message to act on.
     const instruction = firstText(messages);
 
-    // FASE 2: the bidirectional session rides the standard `x-session-id` header (opencode's
-    // x-goog-session-id style affinity header, captured from the opencode upstream dump).
-    const rawSessionId = request.headers['x-session-id'];
-    const sessionId = typeof rawSessionId === 'string' && rawSessionId.length > 0 ? rawSessionId : undefined;
     const store = options.sessionStore ?? defaultSessionStore;
     const session = sessionId ? store.get(sessionId) : undefined;
 
@@ -942,12 +940,36 @@ const RESERVED_BODY_KEYS: ReadonlySet<string> = new Set([
   'context_window_size',
 ]);
 
-function buildPassthrough(body: Record<string, unknown>): Record<string, unknown> {
+/**
+ * ADR A-010 — cache identifiers. The OPENAI-compatible cache identifiers are `prompt_cache_key`
+ * (cache group for prompt caching) and `prompt_cache_retention` (time-to-keep the cached
+ * prefix). Clients may also send vendor-specific aliases (OpenCode ships `promptCacheKey` /
+ * `set_cache_key` — the same value, camel/snake variants, never the OpenAI field name): the
+ * proxy normalizes every alias to the single standard `prompt_cache_key` so upstream servers
+ * that key their prompt cache on the field (llama.cpp, LiteLLM) actually see it. When the
+ * client provides no identifier at all, the proxy synthesizes one from the conversation's
+ * affinity header (`x-session-id`) so that a whole conversation — every loop phase, every
+ * subagent phase, every resume — shares one cache group upstream. Without a session id there
+ * is no stable conversation identity, so no key is synthesized (A-007: never invent values).
+ */
+const CACHE_IDENTITY_KEYS: ReadonlySet<string> = new Set(['prompt_cache_key', 'promptCacheKey', 'set_cache_key']);
+
+function clientCacheKey(body: Record<string, unknown>): string | undefined {
+  for (const key of ['prompt_cache_key', 'promptCacheKey', 'set_cache_key']) {
+    const v = (body ?? {})[key];
+    if (typeof v === 'string' && v.length > 0) return v;
+  }
+  return undefined;
+}
+
+function buildPassthrough(body: Record<string, unknown>, sessionId?: string): Record<string, unknown> {
   const out: Record<string, unknown> = {};
   for (const [key, value] of Object.entries(body ?? {})) {
-    if (RESERVED_BODY_KEYS.has(key) || value === undefined) continue;
+    if (RESERVED_BODY_KEYS.has(key) || CACHE_IDENTITY_KEYS.has(key) || value === undefined) continue;
     out[key] = value;
   }
+  const cacheKey = clientCacheKey(body ?? {}) ?? (sessionId ? `evolve_${sessionId}` : undefined);
+  if (cacheKey) out.prompt_cache_key = cacheKey;
   return out;
 }
 
