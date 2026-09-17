@@ -7,10 +7,10 @@
 // v4 stream parts for streaming), so these exercises the true types through and around my code.
 
 import { describe, it, expect } from 'vitest';
-import type { ProviderClient, V4ChatModel } from '../provider/openai-compatible-provider.js';
-import { OpenAICompatibleProvider } from '../provider/openai-compatible-provider.js';
-import type { UpstreamMessage } from '../types.js';
-import { detectDoomLoop } from '../safety/doom-loop-detector.js';
+import type { ProviderClient, V4ChatModel } from '../infrastructure/provider/openai-compatible-provider.js';
+import { OpenAICompatibleProvider } from '../infrastructure/provider/openai-compatible-provider.js';
+import type { UpstreamMessage } from '../domain/types.js';
+import { detectDoomLoop } from '../domain/safety/doom-loop-detector.js';
 
 const MODEL = 'llama_cpp/default';
 const MESSAGES: UpstreamMessage[] = [{ role: 'user', content: 'do a thing' }];

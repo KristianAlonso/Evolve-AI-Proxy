@@ -54,23 +54,31 @@ request → Interpretar → Planificar → Ejecutar → Evaluar → repetir
 
 ```text
 .
-├── app/                  # código del proxy (servidor)
+├── app/                  # código del proxy (servidor) — arquitectura N-capas (ADR A-013)
 │   ├── src/
 │   │   ├── index.ts                  # entry point (main + guard de import-safety)
-│   │   ├── routes.ts                 # Fastify app factory, hooks, SSE, capturas
-│   │   ├── validate.ts               # validación de requests (400 con todos los issues)
-│   │   ├── sse-writer.ts             # escritor SSE OpenAI-compatible
-│   │   ├── logger.ts                 # logger con rotación + consola (ANSI)
-│   │   ├── env.ts                    # carga .env con dotenv (primer import del entry)
-│   │   ├── config.ts                 # variables de entorno (ver .env)
-│   │   ├── core/                     # bucle agéntico: agent-loop, interpreter, task-generator,
-│   │   │                             # evaluator, context-manager, session-store, stream-helper
-│   │   ├── provider/                 # ChatProvider + impl. OpenAI-compatible (AI SDK v4)
-│   │   ├── safety/                   # auto-healing retry, doom-loop, refusal
+│   │   ├── presentation/             # capa HTTP: app factory, hooks, SSE, ResponseChannel
+│   │   │   ├── app.ts                # createApp() — composición (no decide, solo cablea)
+│   │   │   ├── hooks.ts              # onRequest/onResponse/preValidation/error handler
+│   │   │   ├── sse-channel.ts        # SseResponseChannel (impl. del puerto)
+│   │   │   ├── sse-writer.ts         # escritor SSE OpenAI-compatible (commit perezoso, A-012)
+│   │   │   └── request-meta.ts       # scratch por request
+│   │   ├── application/              # caso de uso: pipeline de POST /v1/chat/completions
+│   │   │   ├── chat-completion-service.ts
+│   │   │   ├── model-resolution.ts   # alias → modelo + context window
+│   │   │   ├── openai-completion.ts  # serializadores wire (completion, finish_reason)
+│   │   │   ├── passthrough.ts        # A-007/A-010: body verbatim + prompt_cache_key
+│   │   │   └── response-channel.ts   # puerto ResponseChannel + ChannelSink
+│   │   ├── domain/                   # bucle agéntico PURO: agent-loop, orchestrator, phases,
+│   │   │                             # loop-state, session-store, subagent-*, safety/, provider/,
+│   │   │                             # logging.ts (puerto), agent-events.ts, validation.ts, types.ts
+│   │   ├── infrastructure/           # implementaciones: provider (Vercel AI SDK),
+│   │   │                             # logger (rotación + ANSI), env/config, capture
 │   │   └── test/                     # unit + integración (live opcional)
 │   ├── .env                          # variables de entorno (valores dev)
 │   └── package.json
 ├── docs/adr/               # Architecture Decision Records
+├── scripts/                # scripts de test (opencode-proxy-test.ps1)
 ├── AGENTS.md               # instrucciones para agentes de IA
 └── README.md
 ```
@@ -78,7 +86,7 @@ request → Interpretar → Planificar → Ejecutar → Evaluar → repetir
 ## Puesta en marcha
 
 Requisitos: Node.js ≥ 22. La app carga [`app/.env`](./app/.env) **automáticamente al
-arrancar** (`src/env.ts` vía `dotenv`): no hace falta exportar nada. El archivo `.env` está
+arrancar** (`src/infrastructure/env.ts` vía `dotenv`): no hace falta exportar nada. El archivo `.env` está
 en `.gitignore` — cópialo y llénalo en cada máquina. Las variables de entorno del shell
 **siempre** tienen prioridad sobre el archivo.
 
@@ -118,7 +126,7 @@ curl http://localhost:8787/health
 
 ## Variables de entorno
 
-Todas definidas en `app/src/config.ts` (y `logger.ts`), con su valor por defecto. Ver
+Todas definidas en `app/src/infrastructure/config.ts` (y `infrastructure/logger.ts`), con su valor por defecto. Ver
 [`app/.env`](./app/.env) para el archivo comentado.
 
 | Variable | Default | Descripción |

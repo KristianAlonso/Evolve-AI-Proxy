@@ -8,9 +8,9 @@
 // client implements by cutting the HTTP stream).
 
 import { describe, expect, it } from 'vitest';
-import { AgentLoop } from '../core/agent-loop.js';
-import { isAbortError } from '../provider/types.js';
-import type { ChatProvider } from '../provider/types.js';
+import { AgentLoop } from '../domain/agent-loop.js';
+import { isAbortError } from '../domain/provider/types.js';
+import type { ChatProvider } from '../domain/provider/types.js';
 import { stub } from './stub-provider.js';
 
 describe('stop propagation: client abort / model stop', () => {

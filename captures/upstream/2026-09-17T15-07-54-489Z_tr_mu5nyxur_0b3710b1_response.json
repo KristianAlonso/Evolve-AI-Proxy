@@ -1,0 +1,26 @@
+{
+  "kind": "response",
+  "timestamp": "2026-09-17T15:07:54.489Z",
+  "model": "llama_cpp/default",
+  "trace_id": "tr_mu5nyxur_0b3710b1",
+  "request": {
+    "messages": [
+      {
+        "role": "user",
+        "content": "Reply with the single word hello."
+      }
+    ],
+    "tools": [],
+    "tool_choice": null,
+    "passthrough": {}
+  },
+  "data": {
+    "buffered": false,
+    "duration_ms": 2065,
+    "text_deltas": 1,
+    "reasoning_deltas": 21,
+    "content": "hello",
+    "reasoning": "The user is asking me to reply with the single word \"hello.\" This is a straightforward request.\n",
+    "tool_calls": []
+  }
+}

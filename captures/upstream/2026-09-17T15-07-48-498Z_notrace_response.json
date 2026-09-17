@@ -1,0 +1,26 @@
+{
+  "kind": "response",
+  "timestamp": "2026-09-17T15:07:48.498Z",
+  "model": "llama_cpp/default",
+  "trace_id": null,
+  "request": {
+    "messages": [
+      {
+        "role": "user",
+        "content": "do a thing"
+      }
+    ],
+    "tools": [],
+    "tool_choice": null,
+    "passthrough": {}
+  },
+  "data": {
+    "buffered": false,
+    "duration_ms": 2,
+    "text_deltas": 3,
+    "reasoning_deltas": 0,
+    "content": "hello world",
+    "reasoning": "",
+    "tool_calls": []
+  }
+}

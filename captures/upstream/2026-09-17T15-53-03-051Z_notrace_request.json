@@ -1,0 +1,20 @@
+{
+  "kind": "request",
+  "timestamp": "2026-09-17T15:53:03.051Z",
+  "model": "llama_cpp/default",
+  "trace_id": null,
+  "request": {
+    "messages": [
+      {
+        "role": "user",
+        "content": "do a thing"
+      }
+    ],
+    "tools": [],
+    "tool_choice": null,
+    "passthrough": {}
+  },
+  "data": {
+    "buffered": true
+  }
+}

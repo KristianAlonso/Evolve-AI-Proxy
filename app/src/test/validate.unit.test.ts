@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { validateRequest } from '../validate.js';
+import { validateRequest } from '../domain/validation.js';
 
 describe('validateRequest (SC-024)', () => {
   const valid = () => ({ model: 'gpt', messages: [{ role: 'user', content: 'hi' }] });

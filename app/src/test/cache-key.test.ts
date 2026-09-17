@@ -14,10 +14,10 @@
 //   4. no session id AND no client value -> no key is invented (A-007).
 
 import { describe, it, expect } from 'vitest';
-import { createApp } from '../routes.js';
-import { SessionStore } from '../core/session-store.js';
-import type { ChatProvider, ProviderCallOptions, UpstreamModel } from '../provider/types.js';
-import type { NormalizedResult, UpstreamMessage } from '../types.js';
+import { createApp } from '../presentation/app.js';
+import { SessionStore } from '../domain/session-store.js';
+import type { ChatProvider, ProviderCallOptions, UpstreamModel } from '../domain/provider/types.js';
+import type { NormalizedResult, UpstreamMessage } from '../domain/types.js';
 
 const BODY = { model: 'gpt-test', messages: [{ role: 'user', content: 'hi' }] };
 

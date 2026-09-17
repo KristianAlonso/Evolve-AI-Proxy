@@ -1,0 +1,42 @@
+{
+  "trace_id": "tr_mu5puja4_f721dae9",
+  "timestamp": "2026-09-17T16:00:26.143Z",
+  "ip": "127.0.0.1",
+  "method": "POST",
+  "url": "/v1/chat/completions",
+  "session": "-",
+  "headers": {
+    "user-agent": "lightMyRequest",
+    "host": "localhost:80",
+    "content-type": "application/json",
+    "content-length": "133"
+  },
+  "summary": {
+    "model": "llama_cpp/default",
+    "stream": false,
+    "message_count": 1,
+    "messages": [
+      {
+        "role": "user",
+        "chars": 35,
+        "tool_calls": 0,
+        "tool_call_id": null
+      }
+    ],
+    "tool_count": 0,
+    "tool_names": [],
+    "tool_choice": null,
+    "body_chars": 133,
+    "est_tokens": 33
+  },
+  "body": {
+    "model": "llama_cpp/default",
+    "messages": [
+      {
+        "role": "user",
+        "content": "Take a single step toward the goal."
+      }
+    ],
+    "context_window_size": 4096
+  }
+}

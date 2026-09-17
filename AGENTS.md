@@ -84,18 +84,58 @@ Toda petición **sin `tools`** que no sea compaction se sirve como **passthrough
 En `resume()`, si el resultado de la fase no llegó por la sesión del subagente, el proxy lo **adopta de la conversación del padre** usando solo wire OpenAI (sin heurísticas de plugins): strict (`tool_call_id = spawn_<agent_id>`) o loose (primer `tool` tras el último `assistant` con tool_calls). El contenido se adopta tal cual — el proxy es **transparente** a cualquier capa intermedia (plugin, runner nativo, contrato ideal). Sin resultado adoptable, el failover de A-006 se mantiene. Los prompts de spawn llevan `ACCEPTANCE: DONE when …` por fase (gates de plugins).
 - Detalle: [docs/adr/a-011-agnostic-phase-result-adoption.md](./docs/adr/a-011-agnostic-phase-result-adoption.md)
 
-## Estructura de carpetas (provisional)
+### A-012: SSE commit perezoso y errores de upstream sin crash
+
+El `SseWriter` **ya no committea nada en el constructor** (ni content-type, ni headers, ni el frame `: connected`): todo se committea en el **primer frame real**. Un fallo de upstream (`ECONNREFUSED`, p. ej. LiteLLM apagado) **antes del primer byte** devuelve un **502 JSON** limpio (`{error:{message,type:'upstream_error',detail,trace_id}}`) en vez de un stream SSE a medio abrir; si el fallo llega **a mitad de stream**, se termina in-band (frame de error + `data:[DONE]` + EOF). El error-handler global ya no lanza `ERR_HTTP_HEADERS_SENT` (cierra el stream si los headers ya salieron). Además, el `model` pedido se **reenvía verbatim** cuando el fetch de `/v1/models` falla (antes mapeaba al `FALLBACK_MODEL`, que vive en el mismo gateway caído).
+- Detalle: [docs/adr/a-012-lazy-sse-commit.md](./docs/adr/a-012-lazy-sse-commit.md)
+
+## Estructura de carpetas
+
+Arquitectura N-capas (ADR A-013) — las dependencias fluyen **solo de arriba a abajo**
+(presentation → application → domain → infrastructure). El dominio es **puro**: sin Fastify,
+sin env/config, sin fs — solo tipos, contratos (puertos) y lógica agéntica.
 
 ```text
 evolve_ai_proxy/
-├── src/
-│   ├── providers/          # Implementaciones por proveedor (openai, anthropic, gemini, ollama)
-│   ├── proxy/              # Lógica central del proxy (routing, transformación, caching)
-│   ├── middleware/           # Logging, auth, rate-limiting
-│   └── index.ts            # Entry point — configura Fastify server
-├── test/                   # Tests unitarios e integration
-├── package.json
-├── tsconfig.json
+├── app/
+│   ├── src/
+│   │   ├── index.ts                # entry point (main + guard de import-safety)
+│   │   ├── presentation/           # Capa HTTP: Fastify app factory, hooks, SSE, ResponseChannel impl
+│   │   │   ├── app.ts              # createApp() — composición (no decide, solo cablea)
+│   │   │   ├── hooks.ts            # onRequest/onResponse/preValidation/error handler
+│   │   │   ├── sse-channel.ts      # SseResponseChannel (impl. del puerto ResponseChannel)
+│   │   │   ├── sse-writer.ts       # writer SSE OpenAI-compatible (commit perezoso, A-012)
+│   │   │   └── request-meta.ts     # scratch por request (Fastify module augmentation)
+│   │   ├── application/            # Casos de uso: el pipeline de POST /v1/chat/completions
+│   │   │   ├── chat-completion-service.ts  # tri-partición FASE 6, passthrough, bucle inline
+│   │   │   ├── model-resolution.ts # alias → modelo + context window (1 fetch /v1/models)
+│   │   │   ├── openai-completion.ts# serializadores wire (completion, finish_reason, errores)
+│   │   │   ├── passthrough.ts      # A-007/A-010: body verbatim + prompt_cache_key
+│   │   │   └── response-channel.ts # PUERTO: ResponseChannel + ChannelSink (LoopSink adapter)
+│   │   ├── domain/                 # Lógica agéntica PURO (sin dependencias externas)
+│   │   │   ├── agent-loop.ts       # bucle iterativo + LoopSink + FinalResultData
+│   │   │   ├── orchestrator.ts     # FASE 6: delegación de fases a subagentes
+│   │   │   ├── interpreter.ts / task-generator.ts / evaluator.ts  # fases del bucle
+│   │   │   ├── phase-prompts.ts    # A-008: única fuente de prompts de fase
+│   │   │   ├── loop-state.ts / session-store.ts / subagent-mapper.ts / subagent-spawn.ts
+│   │   │   ├── stream-helper.ts    # callWithStreaming (helper compartido)
+│   │   │   ├── provider/types.ts   # PUERTO: ChatProvider (+ isAbortError, UpstreamModel)
+│   │   │   ├── logging.ts          # PUERTO: TraceLogger + createNoopLogger()
+│   │   │   ├── agent-events.ts     # SSE_EVENTS / SSEEvent / Phase (contrato loop↔SSE)
+│   │   │   ├── types.ts            # DTOs de dominio (ProxyRequest, ToolCall, …)
+│   │   │   ├── validation.ts       # validación de requests (400 con todos los issues)
+│   │   │   └── safety/             # auto-healing retry, doom-loop, refusal
+│   │   ├── infrastructure/         # Implementaciones concretas (SDK, fs, env)
+│   │   │   ├── provider/openai-compatible-provider.ts  # Vercel AI SDK
+│   │   │   ├── logger.ts           # logger con rotación + consola (ANSI) — implementa TraceLogger
+│   │   │   ├── env.ts / config.ts  # .env + variables de entorno
+│   │   │   └── capture.ts          # capturas JSON de requests entrantes
+│   │   └── test/                   # unit + integración (live opcional)
+│   ├── .env                        # variables de entorno (valores dev)
+│   └── package.json
+├── docs/adr/                       # Architecture Decision Records
+├── scripts/                        # scripts de test (opencode-proxy-test.ps1)
+├── AGENTS.md
 └── README.md
 ```
 
@@ -167,5 +207,5 @@ Además del bucle inline, el proxy puede **delegar las fases planificar/ejecutar
 | [README.md](./README.md) | Documentación completa del proxy (arquitectura, streaming, FASE 6, configuración) |
 | [LICENSE.md](./LICENSE.md) | Apache 2.0 |
 | [CONTRIBUTING.md](./CONTRIBUTING.md) | No existe |
-| [docs/adr/index.md](./docs/adr/index.md) | Índice de decisiones arquitecturales (A-001…A-011) |
+| [docs/adr/index.md](./docs/adr/index.md) | Índice de decisiones arquitecturales (A-001…A-012) |
 | [plans/subagent-phase-delegation.md](./plans/subagent-phase-delegation.md) | Plan FASE 6 — Delegación de fases a subagentes |

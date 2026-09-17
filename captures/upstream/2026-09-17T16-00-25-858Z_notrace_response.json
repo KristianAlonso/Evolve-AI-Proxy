@@ -1,0 +1,33 @@
+{
+  "kind": "response",
+  "timestamp": "2026-09-17T16:00:25.858Z",
+  "model": "llama_cpp/default",
+  "trace_id": null,
+  "request": {
+    "messages": [
+      {
+        "role": "user",
+        "content": "do a thing"
+      }
+    ],
+    "tools": [],
+    "tool_choice": null,
+    "passthrough": {
+      "temperature": 0.7,
+      "max_tokens": 256
+    }
+  },
+  "data": {
+    "buffered": true,
+    "duration_ms": 1,
+    "finish_reason": "stop",
+    "content": "ok",
+    "reasoning": "",
+    "tool_calls": [],
+    "usage": {
+      "prompt_tokens": 1,
+      "completion_tokens": 1,
+      "total_tokens": 2
+    }
+  }
+}

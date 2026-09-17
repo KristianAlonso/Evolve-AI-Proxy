@@ -1,0 +1,547 @@
+// Concrete chat provider backed by an OpenAI-compatible upstream (the LiteLLM target).
+//
+// Transport, request building and response parsing are delegated to Vercel's @ai-sdk/openai-compatible.
+// We still re-normalize the SDK result into the loop's provider-agnostic shape so nothing downstream
+// cares whether it is talking to raw fetch or the SDK: per-turn reasoning/refusal extraction, token
+// usage, and a live delta stream for the agent loop to surface in real time (SC-009 / SC-012).
+
+import { mkdirSync, writeFileSync } from 'node:fs';
+import { createOpenAICompatible } from '@ai-sdk/openai-compatible';
+import env from '../config.js';
+import { createLogger, type TraceLogger } from '../logger.js';
+import type { NormalizedResult, ToolCall, ToolChoice, ToolDefinition, UpstreamMessage } from '../../domain/types.js';
+import { validateRequest } from '../../domain/validation.js';
+import { isAbortError } from '../../domain/provider/types.js';
+import type { ChatProvider, ProviderCallOptions, UpstreamModel, StreamChunk } from '../../domain/provider/types.js';
+
+/** The SDK chat model handle returned by a call to `.chatModel(id)`. */
+export type V4ChatModel = ReturnType<ReturnType<typeof createOpenAICompatible>['chatModel']>;
+
+/** The exact prompt type `doGenerate`/`doStream` expect (v4 message array). */
+type V4Prompt = Parameters<V4ChatModel['doGenerate']>[0]['prompt'];
+
+/** A single text part — the only input shape this provider builds. */
+interface TextPart {
+  type: 'text';
+  text: string;
+}
+
+export interface ProviderClient {
+  chatModel(modelId: string): V4ChatModel;
+}
+
+/** Builds the SDK-backed client from a base URL / API key (production default). */
+type ClientFactory = (baseUrl: string, apiKey: string | undefined) => ProviderClient;
+
+/**
+ * Stable provider name for the SDK client. The SDK derives its `providerOptions` namespace from
+ * this name (`providerOptions[providerName]`), and ADR A-007 uses that namespace as the raw
+ * channel that carries the client's unknown request fields verbatim into the upstream body — so
+ * the name must be STABLE (a host-derived name like the old default would break the namespace and
+ * would contain dots/colons that mangle it). Exported so `forwardOptions()` and tests agree on it.
+ */
+export const PROVIDER_NAME = 'evolve_upstream';
+
+function createSdkClient(baseUrl: string, apiKey: string | undefined): ProviderClient {
+  const sdk = createOpenAICompatible({ baseURL: `${baseUrl}/v1`, name: PROVIDER_NAME, apiKey });
+  // `chatModel` is the only surface we depend on — re-expose it so tests can swap in a fake client.
+  return { chatModel: (modelId: string) => sdk.chatModel(modelId as any) };
+}
+
+/** The provider, wired to the upstream via the AI SDK. */
+export class OpenAICompatibleProvider implements ChatProvider {
+  private baseUrl: string;
+  private apiKey: string | undefined;
+  private logger: TraceLogger;
+  private modelsCache: UpstreamModel[] | null = null;
+  private client?: ProviderClient;
+  private readonly createClient: ClientFactory;
+
+  constructor(
+    baseUrl = env.UPSTREAM_BASE_URL,
+    apiKey = env.UPSTREAM_API_KEY,
+    // Injectable so tests can drive the forwarding/normalization logic with a fake chat model
+    // instead of mocking global fetch (the SDK owns transport and its own SSE parsing).
+    createClient: ClientFactory = createSdkClient,
+    // Traced request logger (routes passes one bound to the request's trace id) so every
+    // upstream call lands in the same audit trail as the request that triggered it.
+    logger?: TraceLogger,
+  ) {
+    this.baseUrl = baseUrl.replace(/\/$/, '');
+    this.apiKey = apiKey;
+    this.createClient = createClient;
+    this.logger = logger ?? createLogger('upstream');
+  }
+
+  /** Lazily build the SDK client (one-time) so it carries a consistent base URL / API key. */
+  private getClient(): ProviderClient {
+    if (!this.client) {
+      this.client = this.createClient(this.baseUrl, this.apiKey);
+    }
+    return this.client;
+  }
+
+  async listModels(): Promise<UpstreamModel[]> {
+    if (this.modelsCache) return this.modelsCache;
+    const t0 = Date.now();
+    try {
+      const res = await fetch(`${this.baseUrl}/v1/models`, {
+        headers: this.apiKey ? { Authorization: `Bearer ${this.apiKey}` } : {},
+      });
+      if (!res.ok) throw new Error(`/v1/models returned HTTP ${res.status}`);
+      const json = (await res.json()) as { data?: UpstreamModel[] };
+      this.modelsCache = json.data ?? [];
+      this.logger.info(`models fetched: ${this.modelsCache.length} model(s) in ${Date.now() - t0}ms from ${this.baseUrl}`);
+      return this.modelsCache;
+    } catch (e) {
+      this.logger.warn(`models fetch failed (${Date.now() - t0}ms): ${(e as Error).message}`);
+      return [];
+    }
+  }
+
+  // ---- Upstream call capture (SC-025 debugging): dump every request sent to the model API and
+  // ---- every response/error back, to `CAPTURE_DIR/upstream/<utc>_<traceId>_<kind>.json`, so the
+  // ---- exact wire content (messages + tool schemas, not just names) is inspectable on disk.
+  private captureUpstream(
+    kind: 'request' | 'response' | 'error',
+    model: string | null,
+    messages: UpstreamMessage[],
+    options: ProviderCallOptions | undefined,
+    data: Record<string, unknown>,
+  ): void {
+    if (!env.CAPTURE_REQUESTS) return;
+    try {
+      const entry = {
+        kind,
+        timestamp: new Date().toISOString(),
+        model: model ?? null,
+        trace_id: options?.trace_id ?? null,
+        request: {
+          messages,
+          tools: options?.tools ?? [],
+          tool_choice: options?.tool_choice ?? null,
+          // ADR A-007 (passthrough-intacto): the FULL forwarded request shape — every client field
+          // the proxy passes through, verbatim (no max_tokens/temperature here any more).
+          passthrough: options?.passthrough ?? {},
+        },
+        data,
+      };
+      const stamp = new Date().toISOString().replace(/[:.]/g, '-');
+      const trace = options?.trace_id ?? 'notrace';
+      const file = `${env.CAPTURE_DIR}/upstream/${stamp}_${trace}_${kind}.json`;
+      mkdirSync(`${env.CAPTURE_DIR}/upstream`, { recursive: true });
+      writeFileSync(file, JSON.stringify(entry, null, 2));
+    } catch {
+      /* captures are debugging aids — they must never crash a call */
+    }
+  }
+
+  async complete(
+    model: string | null,
+    messages: UpstreamMessage[],
+    options?: ProviderCallOptions,
+  ): Promise<NormalizedResult> {
+    // Rule (no auto): the upstream must NEVER be asked to choose a model. Every call has to target
+    // a concrete model selected by the user in the incoming request. Guard here — the single
+    // transport gate — so no loop stage can slip "auto" (or an un-set model) past. If a caller
+    // passes auto/null/empty, fail fast and loudly instead of silently gateway-deciding.
+    if (model === null || model === undefined || model === '' || model === 'auto') {
+      throw new Error(
+        `refusing to send model=${model === null ? 'null' : JSON.stringify(model)}: ` +
+          'every upstream call must target a concrete model selected by the user',
+      );
+    }
+
+    // Structural guard against malformed payloads before dispatching — keeps validateRequest as
+    // defense in depth on top of the SDK's own input validation.
+    try {
+      validateRequest({ model, messages } as unknown);
+    } catch {
+      /* the target validates upstream; this is only defensive */
+    }
+
+    const callLog = options?.logger ?? this.logger;
+    const t0 = Date.now();
+    callLog.debug(
+      `upstream request (buffered): model=${model} messages=${messages.length} ` +
+      `tools=${options?.tools?.length ? options.tools.map((t) => t.function.name).join(',') : '-'}`,
+    );
+    this.captureUpstream('request', model, messages, options, { buffered: true });
+    try {
+      const result = await this.getClient().chatModel(model).doGenerate({
+        prompt: toV4Messages(messages) as V4Prompt,
+        // Forward the caller's per-call knobs into v4 call options so they reach the upstream request
+        // body (the SDK maps max_tokens -> maxOutputTokens, temperature, tools, toolChoice, etc.).
+        // Omitted fields stay undefined and are dropped from the body — no change to defaults.
+        ...forwardOptions(options),
+        // Stop propagation (SC-023): a client disconnect / explicit stop cancels the fetch to the
+        // upstream API in flight instead of letting it run to completion for a dead client.
+        abortSignal: options?.abort_signal,
+      });
+
+      const norm = this.toNormalized(result);
+      callLog.info(
+        `upstream response (buffered): model=${model} ${Date.now() - t0}ms ` +
+        `content_len=${norm.content?.length ?? 0} reasoning_len=${norm.reasoning.length} ` +
+        `tool_calls=${norm.tool_calls.length ? norm.tool_calls.map((c) => c.function.name).join(',') : '-'} ` +
+        `finish=${norm.finish_reason ?? '-'} ` +
+        `tokens=${norm.usage ? `in=${norm.usage.prompt_tokens} out=${norm.usage.completion_tokens}` : '-'}`,
+      );
+      this.captureUpstream('response', model, messages, options, {
+        buffered: true,
+        duration_ms: Date.now() - t0,
+        finish_reason: norm.finish_reason,
+        content: norm.content,
+        reasoning: norm.reasoning,
+        tool_calls: norm.tool_calls,
+        usage: norm.usage,
+      });
+      return norm;
+    } catch (err) {
+      // The SDK wraps aborts in opaque APIErrors ("Failed to process successful response"), so the
+      // signal flag is the reliable indicator, not just the error shape.
+      if (isAbortError(err) || options?.abort_signal?.aborted) {
+        callLog.warn(`upstream aborted (buffered): model=${model} ${Date.now() - t0}ms — client stopped the request`);
+      } else {
+        callLog.error(`upstream request failed (buffered): model=${model} ${Date.now() - t0}ms: ${(err as Error).message}`);
+      }
+      this.captureUpstream('error', model, messages, options, {
+        buffered: true,
+        duration_ms: Date.now() - t0,
+        error: String(err instanceof Error ? err.message : err),
+      });
+      throw err;
+    }
+  }
+
+  /**
+   * SSE token stream of the same response `complete` produces. Streams delta chunks to `onChunk` as
+   * they arrive so an orchestrator can surface live reasoning and detect runaway repeats mid-run
+   * (SC-009 / SC-012). Driven by @ai-sdk/openai-compatible's doStream({ prompt }), which yields a
+   * v4 stream of parts; we read 'text-delta'/'reasoning-delta' events and forward each delta. The
+   * promise resolves once the stream completes (or throws on a non-2xx response, whose error then
+   * propagates to the client).
+   */
+  async completeStream(
+    model: string | null,
+    messages: UpstreamMessage[],
+    opts?: { options?: ProviderCallOptions; onChunk: (chunk: StreamChunk) => void },
+  ): Promise<void> {
+    const onChunk = opts?.onChunk ?? (() => {});
+
+    // Same transport gate as `complete` (no auto): the upstream must never be asked to pick a model.
+    if (model === null || model === undefined || model === '' || model === 'auto') {
+      throw new Error(
+        `refusing to send model=${model === null ? 'null' : JSON.stringify(model)}: ` +
+          'every upstream call must target a concrete model selected by the user',
+      );
+    }
+
+    const callLog = opts?.options?.logger ?? this.logger;
+    const t0 = Date.now();
+    let textDeltas = 0;
+    let reasoningDeltas = 0;
+    const streamedToolCalls: string[] = [];
+    // Accumulated output kept ONLY for the on-disk response capture (the stream itself still
+    // forwards each delta verbatim to onChunk — no buffering of the live path).
+    let accContent = '';
+    let accReasoning = '';
+    const accToolCalls: ToolCall[] = [];
+    callLog.debug(
+      `upstream request (stream): model=${model} messages=${messages.length} ` +
+      `tools=${opts?.options?.tools?.length ? opts.options.tools.map((t) => t.function.name).join(',') : '-'}`,
+    );
+    this.captureUpstream('request', model, messages, opts?.options, { buffered: false });
+    try {
+      const result = await this.getClient().chatModel(model).doStream({
+        prompt: toV4Messages(messages) as V4Prompt,
+        ...forwardOptions(opts?.options),
+        // Stop propagation (SC-023): cancel the in-flight upstream stream on client abort.
+        abortSignal: opts?.options?.abort_signal,
+      });
+
+      for await (const part of result.stream as AsyncIterable<{ type: string; delta?: string; toolCallId?: string; toolName?: string; input?: unknown }>) {
+        if (part.type === 'text-delta') {
+          textDeltas++;
+          const delta = part.delta ?? '';
+          accContent += delta;
+          onChunk({ content: delta, reasoning: null });
+        } else if (part.type === 'reasoning-delta') {
+          reasoningDeltas++;
+          const delta = part.delta ?? '';
+          accReasoning += delta;
+          onChunk({ reasoning: delta, content: null });
+        } else if (part.type === 'tool-call') {
+          // A finalized native tool call (FASE 2): the SDK has already accumulated its argument
+          // deltas. We emit the COMPLETE call in one chunk so the client receives a robust,
+          // parseable tool call rather than incremental argument fragments.
+          streamedToolCalls.push(part.toolName ?? '?');
+          const tc: ToolCall = {
+            id: part.toolCallId ?? '',
+            type: 'function',
+            function: { name: part.toolName ?? '', arguments: stringifyArguments(part.input) },
+          };
+          accToolCalls.push(tc);
+          onChunk({ content: null, reasoning: null, tool_call: tc });
+        }
+      }
+
+      callLog.info(
+        `upstream response (stream): model=${model} ${Date.now() - t0}ms ` +
+        `text_deltas=${textDeltas} reasoning_deltas=${reasoningDeltas} ` +
+        `tool_calls=${streamedToolCalls.length ? streamedToolCalls.join(',') : '-'}`,
+      );
+      this.captureUpstream('response', model, messages, opts?.options, {
+        buffered: false,
+        duration_ms: Date.now() - t0,
+        text_deltas: textDeltas,
+        reasoning_deltas: reasoningDeltas,
+        content: accContent,
+        reasoning: accReasoning,
+        tool_calls: accToolCalls,
+      });
+    } catch (err) {
+      // The SDK wraps aborts in opaque APIErrors ("Failed to process successful response"), so the
+      // signal flag is the reliable indicator, not just the error shape.
+      if (isAbortError(err) || opts?.options?.abort_signal?.aborted) {
+        callLog.warn(`upstream aborted (stream): model=${model} ${Date.now() - t0}ms — client stopped the request`);
+      } else {
+        callLog.error(`upstream request failed (stream): model=${model} ${Date.now() - t0}ms: ${(err as Error).message}`);
+      }
+      this.captureUpstream('error', model, messages, opts?.options, {
+        buffered: false,
+        duration_ms: Date.now() - t0,
+        partial_content: accContent,
+        partial_reasoning: accReasoning,
+        error: String(err instanceof Error ? err.message : err),
+      });
+      throw err;
+    }
+  }
+
+  /** Normalize an SDK v4 generate result into the loop's provider-agnostic shape. */
+  private toNormalized(result: Awaited<ReturnType<V4ChatModel['doGenerate']>>): NormalizedResult {
+    let content = '';
+    let reasoning = '';
+    const tool_calls: ToolCall[] = [];
+
+    for (const part of result.content) {
+      if (part.type === 'text') {
+        content += part.text ?? '';
+      } else if (part.type === 'reasoning') {
+        reasoning += part.text ?? '';
+      } else if (part.type === 'tool-call') {
+        // The upstream model requested a native tool call (FASE 2): carry it through so the loop
+        // can delegate it to the client instead of executing it here.
+        tool_calls.push({
+          id: part.toolCallId,
+          type: 'function',
+          function: { name: part.toolName, arguments: stringifyArguments(part.input) },
+        });
+      }
+    }
+
+    return {
+      content: content.trim() || null,
+      reasoning,
+      tool_calls,
+      usage: result.usage
+        ? {
+            prompt_tokens: result.usage.inputTokens?.total ?? 0,
+            completion_tokens: result.usage.outputTokens?.total ?? 0,
+            total_tokens: (result.usage.inputTokens?.total ?? 0) + (result.usage.outputTokens?.total ?? 0),
+          }
+        : undefined,
+      refused: result.finishReason.unified === 'content-filter',
+      finish_reason: result.finishReason.unified,
+      raw: {},
+    };
+  }
+}
+
+/** The distinct v4 message shapes the SDK requires (system is a string, others are part arrays). */
+type SystemMessage = { role: 'system'; content: string };
+
+type ToolCallPart = {
+  type: 'tool-call';
+  toolCallId: string;
+  toolName: string;
+  input: unknown;
+};
+type ToolResultPart = {
+  type: 'tool-result';
+  toolCallId: string;
+  toolName: string;
+  output: { type: 'text'; value: string };
+};
+type TextUserOrAssistantMessage = {
+  role: 'user' | 'assistant';
+  content: Array<TextPart | ToolCallPart>;
+};
+type ToolMessage = { role: 'tool'; content: ToolResultPart[] };
+type V4PromptEntry = SystemMessage | TextUserOrAssistantMessage | ToolMessage;
+
+/** Map loop messages to AI SDK v4 messages (text turns, delegated tool calls, tool results). */
+function toV4Messages(messages: UpstreamMessage[]): V4PromptEntry[] {
+  return messages.map((message) => {
+    if (message.role === 'system') {
+      return { role: 'system', content: message.content ?? '' } satisfies SystemMessage;
+    }
+    if (message.role === 'tool') {
+      // A tool-result turn (FASE 2 resume): the client ran a delegated tool and feeds the output
+      // back. The provider serializes it as a `tool` message the model understands.
+      return {
+        role: 'tool',
+        content: [
+          {
+            type: 'tool-result',
+            toolCallId: message.tool_call_id ?? '',
+            toolName: message.tool_name ?? 'tool',
+            output: { type: 'text', value: message.content ?? '' },
+          },
+        ],
+      } satisfies ToolMessage;
+    }
+    if (message.role === 'assistant' && message.tool_calls && message.tool_calls.length > 0) {
+      // A prior delegated turn (FASE 2 resume): the assistant asked for tool calls; content may be
+      // null on the wire when the turn carried only tool calls.
+      const parts: Array<TextPart | ToolCallPart> = [];
+      if (message.content) parts.push({ type: 'text', text: message.content });
+      for (const call of message.tool_calls) {
+        parts.push({
+          type: 'tool-call',
+          toolCallId: call.id,
+          toolName: call.function.name,
+          input: parseToolCallArguments(call.function.arguments),
+        });
+      }
+      return { role: 'assistant', content: parts } satisfies TextUserOrAssistantMessage;
+    }
+    return {
+      role: message.role,
+      content: [{ type: 'text', text: message.content ?? '' }],
+    } satisfies TextUserOrAssistantMessage;
+  });
+}
+
+/** Convert OpenAI-style request-body tools into the AI SDK tool shape (FASE 2). */
+function toSdkTools(tools?: ToolDefinition[]): Array<Record<string, unknown>> | undefined {
+  if (!tools || tools.length === 0) return undefined;
+  return tools.map((tool) => ({
+    type: 'function',
+    name: tool.function.name,
+    ...(tool.function.description !== undefined ? { description: tool.function.description } : {}),
+    inputSchema: tool.function.parameters ?? { type: 'object', properties: {} },
+  }));
+}
+
+/** Convert OpenAI `tool_choice` ('auto'|'none'|'required'|{function:{name}}) to the SDK shape. */
+function toSdkToolChoice(choice?: ToolChoice): Record<string, unknown> | undefined {
+  if (choice === undefined) return undefined;
+  if (typeof choice === 'string') return { type: choice };
+  return { type: 'tool', toolName: choice.function.name };
+}
+
+/** Forward per-call knobs into v4 call options (undefined fields are dropped from the body). */
+function forwardOptions(options?: ProviderCallOptions): Record<string, unknown> {
+  return buildForwardOptions(options);
+}
+
+/**
+ * ADR A-007 — passthrough-intacto. Maps the client's request fields into what the SDK must see:
+ *  - recognized fields -> standard v4 options (the SDK knows their OpenAI body field names);
+ *  - everything else  -> `providerOptions[PROVIDER_NAME]`, which the SDK spreads RAW into the
+ *    upstream request body (top_k, logprobs, stream_options, user, metadata, service_tier,
+ *    parallel_tool_calls, reasoning_effort, response_format, ...). The proxy never invents values:
+ *    what the client did not set is simply not sent.
+ * Reserved keys (messages/model/stream are transformed or SDK-managed; tools/tool_choice ride
+ * their own converted path; the evolve_* controls are proxy directives, not model API params).
+ */
+/**
+ * Client body fields that are NEVER forwarded: `messages`/`model` are transformed (the loop
+ * rebuilds the conversation, the model is alias-resolved), `stream` is SDK-managed (doGenerate =
+ * buffered, doStream = stream), `tools`/`tool_choice` ride their own converted path below, and the
+ * evolve controls are proxy directives, not model API parameters.
+ */
+const RESERVED_PASSTHROUGH_KEYS: ReadonlySet<string> = new Set([
+  'model',
+  'messages',
+  'stream',
+  'tools',
+  'tool_choice',
+  'max_rounds',
+  'max_retries',
+  'doom_loop_threshold',
+  'context_window_size',
+]);
+
+export function buildForwardOptions(options?: ProviderCallOptions): Record<string, unknown> {
+  const out: Record<string, unknown> = {};
+  const raw: Record<string, unknown> = {};
+  for (const [key, value] of Object.entries(options?.passthrough ?? {})) {
+    if (RESERVED_PASSTHROUGH_KEYS.has(key) || value === undefined) continue;
+    switch (key) {
+      // Recognized fields: the SDK already knows their OpenAI body field names.
+      case 'temperature':
+        out.temperature = value as number;
+        break;
+      case 'top_p':
+        out.topP = value as number;
+        break;
+      case 'max_tokens':
+        out.maxOutputTokens = value as number;
+        break;
+      case 'seed':
+        out.seed = value as number;
+        break;
+      case 'stop':
+        out.stopSequences = Array.isArray(value) ? value : [value];
+        break;
+      case 'frequency_penalty':
+        out.frequencyPenalty = value as number;
+        break;
+      case 'presence_penalty':
+        out.presencePenalty = value as number;
+        break;
+      case 'reasoning_effort':
+        // The SDK writes `reasoning_effort` into the body AFTER its raw providerOptions spread
+        // (with `undefined` when the v4 `reasoning` option is unset — a raw entry would be
+        // clobbered). A string `reasoning` is the SDK's "custom reasoning" payload and is passed
+        // straight through to the body's `reasoning_effort` field.
+        out.reasoning = value as string;
+        break;
+      default:
+        raw[key] = value; // top_k, logprobs, stream_options, user, metadata, ...
+    }
+  }
+  const tools = toSdkTools(options?.tools);
+  if (tools) out.tools = tools;
+  const toolChoice = toSdkToolChoice(options?.tool_choice);
+  if (toolChoice) out.toolChoice = toolChoice;
+  if (Object.keys(raw).length > 0) {
+    // The SDK spreads every unknown providerOptions[key] entry verbatim into the request body —
+    // that is the verbatim channel for the fields it does not model natively (top_k is explicitly
+    // "unsupported" by the SDK, so it MUST come through here).
+    out.providerOptions = { [PROVIDER_NAME]: raw };
+  }
+  return out;
+}
+
+/** Stringify a tool-call input (already a string upstream stays untouched). */
+function stringifyArguments(input: unknown): string {
+  if (typeof input === 'string') return input;
+  try {
+    return JSON.stringify(input ?? {});
+  } catch {
+    return '{}';
+  }
+}
+
+/** Parse a wire `arguments` string back into a JSON value for the SDK tool-call part. */
+function parseToolCallArguments(args: string): unknown {
+  try {
+    return JSON.parse(args) as unknown;
+  } catch {
+    return args;
+  }
+}

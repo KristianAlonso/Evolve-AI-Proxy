@@ -1,5 +1,5 @@
 import { describe, it, expect, vi } from 'vitest';
-import { SseWriter, SSE_EVENTS } from '../sse-writer.js';
+import { SseWriter, SSE_EVENTS } from '../presentation/sse-writer.js';
 
 // Minimal FastifyReply stand-in that captures what the writer streams. We don't start a server:
 // we just assert the emitted SSE framing is well-formed (SC-009/010) and surfaces disconnects (SC-023).

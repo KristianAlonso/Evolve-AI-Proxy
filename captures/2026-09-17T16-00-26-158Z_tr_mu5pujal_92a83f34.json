@@ -1,0 +1,91 @@
+{
+  "trace_id": "tr_mu5pujal_92a83f34",
+  "timestamp": "2026-09-17T16:00:26.158Z",
+  "ip": "127.0.0.1",
+  "method": "POST",
+  "url": "/v1/chat/completions",
+  "session": "-",
+  "headers": {
+    "user-agent": "lightMyRequest",
+    "host": "localhost:80",
+    "content-type": "application/json",
+    "content-length": "438"
+  },
+  "summary": {
+    "model": "gpt-test",
+    "stream": false,
+    "message_count": 3,
+    "messages": [
+      {
+        "role": "user",
+        "chars": 15,
+        "tool_calls": 0,
+        "tool_call_id": null
+      },
+      {
+        "role": "assistant",
+        "chars": 4,
+        "tool_calls": 1,
+        "tool_call_id": null
+      },
+      {
+        "role": "tool",
+        "chars": 8,
+        "tool_calls": 0,
+        "tool_call_id": "call_1"
+      }
+    ],
+    "tool_count": 1,
+    "tool_names": [
+      "search"
+    ],
+    "tool_choice": null,
+    "body_chars": 438,
+    "est_tokens": 110
+  },
+  "body": {
+    "model": "gpt-test",
+    "messages": [
+      {
+        "role": "user",
+        "content": "find the answer"
+      },
+      {
+        "role": "assistant",
+        "content": null,
+        "tool_calls": [
+          {
+            "id": "call_1",
+            "type": "function",
+            "function": {
+              "name": "search",
+              "arguments": "{\"q\":\"x\"}"
+            }
+          }
+        ]
+      },
+      {
+        "role": "tool",
+        "tool_call_id": "call_1",
+        "content": "found it"
+      }
+    ],
+    "tools": [
+      {
+        "type": "function",
+        "function": {
+          "name": "search",
+          "description": "search the web",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "q": {
+                "type": "string"
+              }
+            }
+          }
+        }
+      }
+    ]
+  }
+}

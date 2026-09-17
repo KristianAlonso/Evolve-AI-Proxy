@@ -10,8 +10,8 @@
 //
 // A "no network" requirement — every call is served locally, no upstream access.
 
-import type { ChatProvider, ProviderCallOptions, StreamChunk, UpstreamModel } from '../provider/types.js';
-import type { NormalizedResult, ToolCall, UpstreamMessage } from '../types.js';
+import type { ChatProvider, ProviderCallOptions, StreamChunk, UpstreamModel } from '../domain/provider/types.js';
+import type { NormalizedResult, ToolCall, UpstreamMessage } from '../domain/types.js';
 
 export interface StubRecord {
   model: string | null;

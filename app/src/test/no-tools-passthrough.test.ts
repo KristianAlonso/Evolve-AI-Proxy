@@ -10,10 +10,33 @@
 //   3. the session store is never created, saved or deleted — a parent's loopState survives.
 
 import { describe, it, expect } from 'vitest';
-import { createApp } from '../routes.js';
+import { createApp } from '../presentation/app.js';
 import { stub, streamingStub } from './stub-provider.js';
-import { SessionStore } from '../core/session-store.js';
-import { newLoopState, type LoopStateData } from '../core/loop-state.js';
+import { SessionStore } from '../domain/session-store.js';
+import { newLoopState, type LoopStateData } from '../domain/loop-state.js';
+import type { ChatProvider, UpstreamModel } from '../domain/provider/types.js';
+
+/** A provider that records the requested model and then fails like a dead gateway (ECONNREFUSED). */
+function deadUpstream() {
+  const record: { lastModel: string | null } = { lastModel: null };
+  const fail = (model: string | null): Promise<never> => {
+    record.lastModel = model;
+    return Promise.reject(new Error('fetch failed: [ECONNREFUSED 26.238.135.219:4000]'));
+  };
+  const provider: ChatProvider = {
+    // The /v1/models fetch fails too — the gateway is down, not just one model.
+    async listModels(): Promise<UpstreamModel[]> {
+      throw new Error('fetch failed: [ECONNREFUSED 26.238.135.219:4000]');
+    },
+    complete(model: string | null) {
+      return fail(model);
+    },
+    completeStream(model: string | null) {
+      return fail(model);
+    },
+  };
+  return { provider, record };
+}
 
 const TITLE_MESSAGES = [
   { role: 'system' as const, content: 'You are a title generator. You output ONLY a thread title. Nothing else.' },
@@ -109,5 +132,49 @@ describe('ADR A-009 — no-tools requests are pure passthroughs', () => {
     const session = store.get('sess-parent');
     expect(session).toBeDefined();
     expect(session?.loopState).toBe(loopState);
+  });
+});
+
+describe('upstream down (dead gateway) — a failed request must never crash the process', () => {
+  it('stream + no tools: upstream ECONNREFUSED before the first byte → clean 502 JSON, not a half-open SSE stream', async () => {
+    const { provider, record } = deadUpstream();
+    const app = await createApp({ provider });
+
+    const res = await app.inject({
+      method: 'POST',
+      url: '/v1/chat/completions',
+      headers: { 'x-session-id': 'sess-down' },
+      payload: { model: 'llama_cpp/default', messages: TITLE_MESSAGES, stream: true },
+    });
+
+    // Before the fix this threw ERR_HTTP_HEADERS_SENT and killed the Node process: the eager
+    // SseWriter `: connected` frame committed the 200/status line, so the error handler's
+    // `reply.status(500).send(...)` blew up. Now the response is a clean JSON error.
+    expect(res.statusCode).toBe(502);
+    const body = res.json();
+    expect(body.error.type).toBe('upstream_error');
+    expect(body.error.message).toBe('upstream unavailable');
+
+    // The requested model was forwarded verbatim — the /v1/models fetch also failed, so the proxy
+    // must NOT map to the config fallback (it lives on the same dead gateway).
+    expect(record.lastModel).toBe('llama_cpp/default');
+  });
+
+  it('non-stream + no tools: upstream ECONNREFUSED → 502 JSON with the upstream detail', async () => {
+    const { provider, record } = deadUpstream();
+    const app = await createApp({ provider });
+
+    const res = await app.inject({
+      method: 'POST',
+      url: '/v1/chat/completions',
+      headers: { 'x-session-id': 'sess-down-nostream' },
+      payload: { model: 'llama_cpp/default', messages: TITLE_MESSAGES },
+    });
+
+    expect(res.statusCode).toBe(502);
+    const body = res.json();
+    expect(body.error.type).toBe('upstream_error');
+    expect(String(body.error.detail)).toContain('ECONNREFUSED');
+    expect(record.lastModel).toBe('llama_cpp/default');
   });
 });

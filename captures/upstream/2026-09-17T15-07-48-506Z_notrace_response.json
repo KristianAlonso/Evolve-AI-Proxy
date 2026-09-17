@@ -1,0 +1,30 @@
+{
+  "kind": "response",
+  "timestamp": "2026-09-17T15:07:48.506Z",
+  "model": "llama_cpp/default",
+  "trace_id": null,
+  "request": {
+    "messages": [
+      {
+        "role": "user",
+        "content": "do a thing"
+      }
+    ],
+    "tools": [],
+    "tool_choice": null,
+    "passthrough": {}
+  },
+  "data": {
+    "buffered": true,
+    "duration_ms": 1,
+    "finish_reason": "stop",
+    "content": "hello world",
+    "reasoning": "",
+    "tool_calls": [],
+    "usage": {
+      "prompt_tokens": 3,
+      "completion_tokens": 5,
+      "total_tokens": 8
+    }
+  }
+}

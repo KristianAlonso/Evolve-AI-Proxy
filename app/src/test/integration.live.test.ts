@@ -9,8 +9,8 @@
 // Run: vitest run integration — only skipped if the gateway is unreachable, so CI can gate on it.
 
 import { describe, it, expect } from 'vitest';
-import { createApp } from '../routes.js';
-import env from '../config.js';
+import { createApp } from '../presentation/app.js';
+import env from '../infrastructure/config.js';
 
 /** Bearer token for the authorized upstream (mirrors UPSTREAM_API_KEY default). */
 const API_KEY = process.env.UPSTREAM_API_KEY ?? 'sk-0cJ81PMjGwHTtXvSSItFfA';
@@ -50,7 +50,8 @@ describe('integration — live upstream (evolve_ai_proxy -> LiteLLM gateway)', (
   });
 
   it('honours a non-streaming request without requiring model resolution', { timeout: 60000 }, async () => {
-    // Passing an explicit model keeps the loop on the direct completion path.
+    // ADR A-009: a request WITHOUT tools is a pure passthrough — one upstream call, reply as-is,
+    // and the evolve meta marks it as such (no agent loop, no session bookkeeping).
     const app = await createApp({ baseUrl: env.UPSTREAM_BASE_URL, apiKey: API_KEY });
     const res = await app.inject({
       method: 'POST',
@@ -60,9 +61,7 @@ describe('integration — live upstream (evolve_ai_proxy -> LiteLLM gateway)', (
     expect(res.statusCode).toBe(200);
     const body = res.json();
     expect(body.choices[0].message.content).toBeTruthy();
-    // evolve meta is attached on the non-streaming path (meta.agent_decision / iterations).
-    expect(typeof body.meta.agent_decision).toBe('string');
-    expect(Number.isInteger(body.meta.iterations_completed)).toBe(true);
+    expect(body.meta.passthrough).toBe('no_tools');
   });
 
   it('rejects malformed bodies at validation (schema gate before any upstream call)', async () => {

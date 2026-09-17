@@ -1,0 +1,53 @@
+{
+  "trace_id": "tr_mu5puja4_c8c8b7d7",
+  "timestamp": "2026-09-17T16:00:26.143Z",
+  "ip": "127.0.0.1",
+  "method": "POST",
+  "url": "/v1/chat/completions",
+  "session": "sess-title-stream",
+  "headers": {
+    "x-session-id": "sess-title-stream",
+    "user-agent": "lightMyRequest",
+    "host": "localhost:80",
+    "content-type": "application/json",
+    "content-length": "233"
+  },
+  "summary": {
+    "model": "gpt-test",
+    "stream": true,
+    "message_count": 2,
+    "messages": [
+      {
+        "role": "system",
+        "chars": 72,
+        "tool_calls": 0,
+        "tool_call_id": null
+      },
+      {
+        "role": "user",
+        "chars": 52,
+        "tool_calls": 0,
+        "tool_call_id": null
+      }
+    ],
+    "tool_count": 0,
+    "tool_names": [],
+    "tool_choice": null,
+    "body_chars": 233,
+    "est_tokens": 58
+  },
+  "body": {
+    "model": "gpt-test",
+    "messages": [
+      {
+        "role": "system",
+        "content": "You are a title generator. You output ONLY a thread title. Nothing else."
+      },
+      {
+        "role": "user",
+        "content": "Generate a brief title for this conversation: \"Hola\""
+      }
+    ],
+    "stream": true
+  }
+}

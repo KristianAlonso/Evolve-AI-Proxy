@@ -6,11 +6,11 @@
 // Vercel AI SDK) finalizes the tool calls and executes them locally. No proprietary events.
 
 import { describe, it, expect } from 'vitest';
-import { createApp } from '../routes.js';
+import { createApp } from '../presentation/app.js';
 import { streamingStub, stub } from './stub-provider.js';
-import { SessionStore } from '../core/session-store.js';
-import type { ChatProvider } from '../provider/types.js';
-import type { ToolCall } from '../types.js';
+import { SessionStore } from '../domain/session-store.js';
+import type { ChatProvider } from '../domain/provider/types.js';
+import type { ToolCall } from '../domain/types.js';
 
 const TOOLS = [
   { type: 'function' as const, function: { name: 'search', description: 'search the web', parameters: { type: 'object', properties: { q: { type: 'string' } } } } },

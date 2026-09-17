@@ -9,14 +9,14 @@
 // `windowSize <= 0` (unknown window) disables the check: the upstream decides (SC-022).
 
 import { describe, expect, it } from 'vitest';
-import { createLogger } from '../logger.js';
-import { COMPACT_PENDING_NOTICE, contextFull, isCompactionRequest } from '../core/phase-prompts.js';
-import { SubagentOrchestrator } from '../core/orchestrator.js';
-import { AgentLoop } from '../core/agent-loop.js';
-import { newLoopState, type LoopStateData } from '../core/loop-state.js';
+import { createLogger } from '../infrastructure/logger.js';
+import { COMPACT_PENDING_NOTICE, contextFull, isCompactionRequest } from '../domain/phase-prompts.js';
+import { SubagentOrchestrator } from '../domain/orchestrator.js';
+import { AgentLoop } from '../domain/agent-loop.js';
+import { newLoopState, type LoopStateData } from '../domain/loop-state.js';
 import { stub } from './stub-provider.js';
-import type { ChatProvider, ProviderCallOptions } from '../provider/types.js';
-import type { NormalizedResult, TokenUsage, ToolDefinition, UpstreamMessage } from '../types.js';
+import type { ChatProvider, ProviderCallOptions } from '../domain/provider/types.js';
+import type { NormalizedResult, TokenUsage, ToolDefinition, UpstreamMessage } from '../domain/types.js';
 
 const log = createLogger('test');
 

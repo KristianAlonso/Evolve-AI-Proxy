@@ -2,10 +2,10 @@
 // orchestrator state machine. No network — every provider is a local stub.
 
 import { describe, expect, it } from 'vitest';
-import { createLogger, type TraceLogger } from '../logger.js';
-import type { ProviderCallOptions } from '../provider/types.js';
-import type { NormalizedResult } from '../types.js';
-import type { ToolCall, ToolDefinition, UpstreamMessage } from '../types.js';
+import { createLogger, type TraceLogger } from '../infrastructure/logger.js';
+import type { ProviderCallOptions } from '../domain/provider/types.js';
+import type { NormalizedResult } from '../domain/types.js';
+import type { ToolCall, ToolDefinition, UpstreamMessage } from '../domain/types.js';
 import {
   buildSpawnPrompt,
   buildSpawnToolCall,
@@ -16,10 +16,10 @@ import {
   parseSubagentEnvelope,
   type SpawnEnvelope,
   type SubagentSpawnSpec,
-} from '../core/subagent-spawn.js';
-import { mapSubagentTool } from '../core/subagent-mapper.js';
-import { SubagentOrchestrator, type OrchestratorOutcome } from '../core/orchestrator.js';
-import { newLoopState, type LoopStateData } from '../core/loop-state.js';
+} from '../domain/subagent-spawn.js';
+import { mapSubagentTool } from '../domain/subagent-mapper.js';
+import { SubagentOrchestrator, type OrchestratorOutcome } from '../domain/orchestrator.js';
+import { newLoopState, type LoopStateData } from '../domain/loop-state.js';
 import { stub } from './stub-provider.js';
 
 const log: TraceLogger = createLogger('test');

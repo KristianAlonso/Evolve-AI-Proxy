@@ -1,0 +1,26 @@
+{
+  "kind": "response",
+  "timestamp": "2026-09-17T13:31:59.660Z",
+  "model": "llama_cpp/default",
+  "trace_id": null,
+  "request": {
+    "messages": [
+      {
+        "role": "user",
+        "content": "do a thing"
+      }
+    ],
+    "tools": [],
+    "tool_choice": null,
+    "passthrough": {}
+  },
+  "data": {
+    "buffered": false,
+    "duration_ms": 1,
+    "text_deltas": 0,
+    "reasoning_deltas": 7,
+    "content": "",
+    "reasoning": "zzz zzz zzz zzz zzz zzz zzz ",
+    "tool_calls": []
+  }
+}

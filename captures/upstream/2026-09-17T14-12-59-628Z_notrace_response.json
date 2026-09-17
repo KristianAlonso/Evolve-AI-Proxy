@@ -1,0 +1,59 @@
+{
+  "kind": "response",
+  "timestamp": "2026-09-17T14:12:59.628Z",
+  "model": "llama_cpp/default",
+  "trace_id": null,
+  "request": {
+    "messages": [
+      {
+        "role": "user",
+        "content": "do a thing"
+      }
+    ],
+    "tools": [
+      {
+        "type": "function",
+        "function": {
+          "name": "real",
+          "parameters": {}
+        }
+      }
+    ],
+    "tool_choice": null,
+    "passthrough": {
+      "model": "alias/name",
+      "messages": [
+        {
+          "role": "user",
+          "content": "x"
+        }
+      ],
+      "stream": true,
+      "tools": [
+        {
+          "type": "function",
+          "function": {
+            "name": "t",
+            "parameters": {}
+          }
+        }
+      ],
+      "tool_choice": "auto",
+      "max_rounds": 3,
+      "doom_loop_threshold": 2
+    }
+  },
+  "data": {
+    "buffered": true,
+    "duration_ms": 1,
+    "finish_reason": "stop",
+    "content": "ok",
+    "reasoning": "",
+    "tool_calls": [],
+    "usage": {
+      "prompt_tokens": 1,
+      "completion_tokens": 1,
+      "total_tokens": 2
+    }
+  }
+}

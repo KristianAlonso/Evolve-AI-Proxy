@@ -1,7 +1,7 @@
 import { describe, it, expect } from 'vitest';
-import { interpretRequest, formatInterpretationTrace } from '../core/interpreter.js';
-import { buildPhasePrompt, INTERPRET_INSTRUCTION } from '../core/phase-prompts.js';
-import type { ChatProvider } from '../provider/types.js';
+import { interpretRequest, formatInterpretationTrace } from '../domain/interpreter.js';
+import { buildPhasePrompt, INTERPRET_INSTRUCTION } from '../domain/phase-prompts.js';
+import type { ChatProvider } from '../domain/provider/types.js';
 import { resp } from './stub-provider.js';
 
 const provider: ChatProvider = {

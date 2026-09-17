@@ -11,15 +11,15 @@
 // so the assertions inspect EXACTLY what the proxy would have sent upstream.
 
 import { describe, it, expect } from 'vitest';
-import { isStructuredRejection } from '../core/phase-prompts.js';
-import { AgentLoop, type LoopOptions } from '../core/agent-loop.js';
-import { SubagentOrchestrator } from '../core/orchestrator.js';
+import { isStructuredRejection } from '../domain/phase-prompts.js';
+import { AgentLoop, type LoopOptions } from '../domain/agent-loop.js';
+import { SubagentOrchestrator } from '../domain/orchestrator.js';
 import { stub, type StubRecord } from './stub-provider.js';
-import { createLogger } from '../logger.js';
-import type { ChatProvider } from '../provider/types.js';
-import type { LoopStateData } from '../core/loop-state.js';
-import type { SubagentSpawnSpec } from '../core/subagent-spawn.js';
-import type { UpstreamMessage } from '../types.js';
+import { createLogger } from '../infrastructure/logger.js';
+import type { ChatProvider } from '../domain/provider/types.js';
+import type { LoopStateData } from '../domain/loop-state.js';
+import type { SubagentSpawnSpec } from '../domain/subagent-spawn.js';
+import type { UpstreamMessage } from '../domain/types.js';
 
 const SYSTEM = 'You are a helpful assistant working on this project.';
 

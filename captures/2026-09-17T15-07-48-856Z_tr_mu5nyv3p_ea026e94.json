@@ -1,0 +1,96 @@
+{
+  "trace_id": "tr_mu5nyv3p_ea026e94",
+  "timestamp": "2026-09-17T15:07:48.856Z",
+  "ip": "127.0.0.1",
+  "method": "POST",
+  "url": "/v1/chat/completions",
+  "session": "sess-sub",
+  "headers": {
+    "x-session-id": "sess-sub",
+    "user-agent": "lightMyRequest",
+    "host": "localhost:80",
+    "content-type": "application/json",
+    "content-length": "719"
+  },
+  "summary": {
+    "model": "gpt-test",
+    "stream": false,
+    "message_count": 3,
+    "messages": [
+      {
+        "role": "user",
+        "chars": 167,
+        "tool_calls": 0,
+        "tool_call_id": null
+      },
+      {
+        "role": "assistant",
+        "chars": 4,
+        "tool_calls": 1,
+        "tool_call_id": null
+      },
+      {
+        "role": "tool",
+        "chars": 21,
+        "tool_calls": 0,
+        "tool_call_id": "call_1"
+      }
+    ],
+    "tool_count": 1,
+    "tool_names": [
+      "bash"
+    ],
+    "tool_choice": null,
+    "body_chars": 719,
+    "est_tokens": 180
+  },
+  "body": {
+    "model": "gpt-test",
+    "messages": [
+      {
+        "role": "user",
+        "content": "{\"phase\":\"execute\",\"parent_session_id\":\"sess-parent\",\"agent_id\":\"agent-x\"}\n\nExecute the task: install the skill grill-me.\nACCEPTANCE: DONE when the skill is installed.",
+        "reasoning": "",
+        "tool_calls": []
+      },
+      {
+        "role": "assistant",
+        "content": null,
+        "reasoning": "",
+        "tool_calls": [
+          {
+            "id": "call_1",
+            "type": "function",
+            "function": {
+              "name": "bash",
+              "arguments": "{\"command\":\"npx skills add grill-me\"}"
+            }
+          }
+        ]
+      },
+      {
+        "role": "tool",
+        "content": "added 1 package in 3s",
+        "tool_call_id": "call_1",
+        "tool_name": "bash"
+      }
+    ],
+    "tools": [
+      {
+        "type": "function",
+        "function": {
+          "name": "bash",
+          "description": "Run a shell command.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "command": {
+                "type": "string"
+              }
+            }
+          }
+        }
+      }
+    ]
+  }
+}

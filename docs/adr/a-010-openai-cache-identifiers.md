@@ -25,7 +25,7 @@ no comparten un grupo de caché explícito.
 
 ## Decisión
 
-Normalización en el único punto común — `buildPassthrough` (`src/routes.ts`), cuya salida
+Normalización en el único punto común — `buildPassthrough` (`src/application/passthrough.ts`), cuya salida
 viaja en `ProviderCallOptions.passthrough` a **toda** llamada upstream (fases del bucle,
 orquestador, mapper, passthroughs):
 

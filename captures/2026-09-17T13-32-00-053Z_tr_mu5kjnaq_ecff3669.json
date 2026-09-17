@@ -1,0 +1,44 @@
+{
+  "trace_id": "tr_mu5kjnaq_ecff3669",
+  "timestamp": "2026-09-17T13:32:00.052Z",
+  "ip": "127.0.0.1",
+  "method": "POST",
+  "url": "/v1/chat/completions",
+  "session": "ses-2",
+  "headers": {
+    "x-session-id": "ses-2",
+    "user-agent": "lightMyRequest",
+    "host": "localhost:80",
+    "content-type": "application/json",
+    "content-length": "125"
+  },
+  "summary": {
+    "model": "gpt-test",
+    "stream": false,
+    "message_count": 1,
+    "messages": [
+      {
+        "role": "user",
+        "chars": 2,
+        "tool_calls": 0,
+        "tool_call_id": null
+      }
+    ],
+    "tool_count": 0,
+    "tool_names": [],
+    "tool_choice": null,
+    "body_chars": 125,
+    "est_tokens": 31
+  },
+  "body": {
+    "model": "gpt-test",
+    "messages": [
+      {
+        "role": "user",
+        "content": "hi"
+      }
+    ],
+    "prompt_cache_key": "explicit",
+    "promptCacheKey": "alias-loser"
+  }
+}

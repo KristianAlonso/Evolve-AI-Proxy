@@ -9,9 +9,9 @@
 // contract* deterministically: consult /v1/models only when the request does not declare a size.
 
 import { describe, it, expect, vi } from 'vitest';
-import { createApp } from '../routes.js';
+import { createApp } from '../presentation/app.js';
 import { stub, type StubRecord } from './stub-provider.js';
-import type { ChatProvider } from '../provider/types.js';
+import type { ChatProvider } from '../domain/provider/types.js';
 
 const PROMPT = [{ role: 'user' as const, content: 'Take a single step toward the goal.' }];
 

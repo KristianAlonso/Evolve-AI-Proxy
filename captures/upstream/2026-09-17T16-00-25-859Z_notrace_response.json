@@ -1,0 +1,48 @@
+{
+  "kind": "response",
+  "timestamp": "2026-09-17T16:00:25.859Z",
+  "model": "llama_cpp/default",
+  "trace_id": null,
+  "request": {
+    "messages": [
+      {
+        "role": "user",
+        "content": "do a thing"
+      }
+    ],
+    "tools": [],
+    "tool_choice": null,
+    "passthrough": {
+      "top_p": 0.9,
+      "top_k": 5,
+      "seed": 42,
+      "stop": [
+        "end"
+      ],
+      "logprobs": true,
+      "stream_options": {
+        "include_usage": true
+      },
+      "user": "client-1",
+      "metadata": {
+        "origin": "opencode"
+      },
+      "parallel_tool_calls": false,
+      "reasoning_effort": "high",
+      "max_completion_tokens": 4096
+    }
+  },
+  "data": {
+    "buffered": true,
+    "duration_ms": 1,
+    "finish_reason": "stop",
+    "content": "ok",
+    "reasoning": "",
+    "tool_calls": [],
+    "usage": {
+      "prompt_tokens": 1,
+      "completion_tokens": 1,
+      "total_tokens": 2
+    }
+  }
+}

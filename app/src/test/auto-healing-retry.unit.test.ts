@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { withAutoHealingRetry, buildAutocorrectPrompt } from '../safety/auto-healing-retry.js';
+import { withAutoHealingRetry, buildAutocorrectPrompt } from '../domain/safety/auto-healing-retry.js';
 
 describe('withAutoHealingRetry (SC-013/014)', () => {
   it('returns a completed result when the first attempt succeeds', async () => {

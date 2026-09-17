@@ -2,10 +2,10 @@
 // Exercises: complete decision, max-rounds abort, and client-disconnect abort (SC-023).
 
 import { describe, it, expect } from 'vitest';
-import { AgentLoop } from '../core/agent-loop.js';
-import type { ChatProvider } from '../provider/types.js';
-import type { LoopSink } from '../core/agent-loop.js';
-import type { ToolCall } from '../types.js';
+import { AgentLoop } from '../domain/agent-loop.js';
+import type { ChatProvider } from '../domain/provider/types.js';
+import type { LoopSink } from '../domain/agent-loop.js';
+import type { ToolCall } from '../domain/types.js';
 import { stub, streamingStub } from './stub-provider.js';
 
 /** Records phases and live-reasoning deltas so we can assert the interpret -> execute -> evaluate sequence. */

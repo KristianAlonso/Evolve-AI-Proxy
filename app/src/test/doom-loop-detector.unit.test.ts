@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { detectDoomLoop } from '../safety/doom-loop-detector.js';
+import { detectDoomLoop } from '../domain/safety/doom-loop-detector.js';
 
 describe('detectDoomLoop (SC-012)', () => {
   it('detects a repeated phrase above the default threshold of 4', () => {

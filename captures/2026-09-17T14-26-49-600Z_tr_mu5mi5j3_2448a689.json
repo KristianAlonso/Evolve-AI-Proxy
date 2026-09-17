@@ -1,0 +1,42 @@
+{
+  "trace_id": "tr_mu5mi5j3_2448a689",
+  "timestamp": "2026-09-17T14:26:49.600Z",
+  "ip": "127.0.0.1",
+  "method": "POST",
+  "url": "/v1/chat/completions",
+  "session": "-",
+  "headers": {
+    "user-agent": "lightMyRequest",
+    "host": "localhost:80",
+    "content-type": "application/json",
+    "content-length": "118"
+  },
+  "summary": {
+    "model": "llama_cpp/default",
+    "stream": true,
+    "message_count": 1,
+    "messages": [
+      {
+        "role": "user",
+        "chars": 33,
+        "tool_calls": 0,
+        "tool_call_id": null
+      }
+    ],
+    "tool_count": 0,
+    "tool_names": [],
+    "tool_choice": null,
+    "body_chars": 118,
+    "est_tokens": 30
+  },
+  "body": {
+    "model": "llama_cpp/default",
+    "messages": [
+      {
+        "role": "user",
+        "content": "Reply with the single word hello."
+      }
+    ],
+    "stream": true
+  }
+}

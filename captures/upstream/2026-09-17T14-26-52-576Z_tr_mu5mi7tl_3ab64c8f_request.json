@@ -1,0 +1,20 @@
+{
+  "kind": "request",
+  "timestamp": "2026-09-17T14:26:52.576Z",
+  "model": "llama_cpp/default",
+  "trace_id": "tr_mu5mi7tl_3ab64c8f",
+  "request": {
+    "messages": [
+      {
+        "role": "user",
+        "content": "Reply with the single word hello."
+      }
+    ],
+    "tools": [],
+    "tool_choice": null,
+    "passthrough": {}
+  },
+  "data": {
+    "buffered": false
+  }
+}
