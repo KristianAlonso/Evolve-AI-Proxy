@@ -162,6 +162,10 @@ describe('ADR A-008 — phase-prompt shaping (inline AgentLoop)', () => {
       totalUpstreamCalls: 0,
       compactPending: false,
       lastUsage: null,
+      questionSpec: null,
+      askingQuestion: false,
+      pendingQuestionToolCallId: null,
+      pendingQuestions: null,
     };
 
     await orch.runSubagentPhase({

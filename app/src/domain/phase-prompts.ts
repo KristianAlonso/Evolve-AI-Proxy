@@ -91,6 +91,46 @@ export function buildEvaluateInstruction(originalInstruction: string, steering?:
 }
 
 /**
+ * User-intervention marker (contract, see buildExecuteInstruction / the spawn prompts): when a
+ * phase output is a question/request directed at the USER, the model replies with EXACTLY one
+ * line starting with `ASK_USER:` followed by the question. The orchestrator detects the marker
+ * deterministically (extractAskUser) and stops the loop IMMEDIATELY — no evaluate round-trip.
+ */
+export const ASK_USER_MARKER = 'ASK_USER:';
+
+/**
+ * The one-line contract text appended to the phase instructions: if the phase CANNOT proceed
+ * without user input, the model must signal it with the ASK_USER marker instead of guessing.
+ */
+export const ASK_USER_CONTRACT =
+  `IF the task CANNOT be completed without input from the USER (a decision, a choice, credentials, ` +
+  `a missing requirement), STOP and reply with EXACTLY one line: ${ASK_USER_MARKER} <your question or ` +
+  `request, in the user's language> — and nothing else. Never guess, never make up an answer yourself.`;
+
+// Batch variant (used when the client exposes a question tool that accepts several questions at
+// once): the model emits the marker followed by a JSON ARRAY of question objects, so the
+// orchestrator can pose ALL pending questions to the user in a single form.
+export const ASK_USER_CONTRACT_BATCH =
+  `IF you CANNOT proceed without input from the USER (a decision, a choice, a missing detail), STOP ` +
+  `and reply with EXACTLY the line ${ASK_USER_MARKER} followed by a JSON ARRAY of question objects — ` +
+  `nothing else, no markdown fences, no prose. Each object: ` +
+  `{"question":"<the question text>","header":"<short label>","options":[{"label":"<option text>","description":"<why this option>"}],"multiple":false}` +
+  ` You may include ALL your questions in that array — they will all be shown to the user at once.`;
+
+/**
+ * Deterministic user-intervention detection: when the (trimmed) phase output starts with the
+ * ASK_USER marker, return the question (marker stripped, trimmed); otherwise null. This is how
+ * the orchestrator stops the loop the moment a phase output IS a question for the user — without
+ * waiting for the evaluate phase (which would cost a whole extra subagent spawn).
+ */
+export function extractAskUser(output: string): string | null {
+  const t = output.trim();
+  if (!t.startsWith(ASK_USER_MARKER)) return null;
+  const q = t.slice(ASK_USER_MARKER.length).trim();
+  return q.length > 0 ? q : null;
+}
+
+/**
  * Execute instruction (user role, appended at the end of the conversation).
  *
  * The raw task description is NOT sent bare: sent as the final user turn while the SAME text
@@ -99,7 +139,11 @@ export function buildEvaluateInstruction(originalInstruction: string, steering?:
  * the plan description, the evaluator — correctly — marked it incomplete). The imperative frame
  * breaks the parroting: execute now, with tool calls, and do not re-plan.
  */
-export function buildExecuteInstruction(description: string, toolsAvailable: boolean): string {
+export function buildExecuteInstruction(
+  description: string,
+  toolsAvailable: boolean,
+  questionMode: 'batch' | 'single' = 'single',
+): string {
   const lines: string[] = [
     'You are the executor of an agent loop. EXECUTE the following task NOW — do not re-plan, '
       + 'do not repeat or summarize the plan, do not propose what to do.',
@@ -110,7 +154,7 @@ export function buildExecuteInstruction(description: string, toolsAvailable: boo
         + 'Reply with plain text only when the task is actually done.',
     );
   }
-  lines.push('', `Task: ${description}`, 'When done, report what was actually done and its concrete outcome.');
+  lines.push('', `Task: ${description}`, 'When done, report what was actually done and its concrete outcome.', questionMode === 'batch' ? ASK_USER_CONTRACT_BATCH : ASK_USER_CONTRACT);
   return lines.join('\n');
 }
 

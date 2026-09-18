@@ -10,6 +10,7 @@
 import type { AgentTask, ContextStep, LoopDecision, TokenUsage, ToolChoice, ToolDefinition, UpstreamMessage } from './types.js';
 import type { Interpretation } from './interpreter.js';
 import type { SubagentSpawnSpec } from './subagent-spawn.js';
+import type { QuestionItem, QuestionToolSpec } from './question-tool.js';
 
 export const ORCHESTRATOR_STAGES = ['planify', 'execute', 'evaluate', 'done'] as const;
 export type OrchestratorStage = (typeof ORCHESTRATOR_STAGES)[number];
@@ -86,6 +87,16 @@ export interface LoopStateData {
    * the reply as steering and resumes at the stored stage (planify, round+1).
    */
   awaitingUser: boolean;
+  /** FASE 6 — question tool (mimics the spawn-tool mapping): the client's question tool, when
+   *  mapped by the model at session start. null = no question tool → single-question mode. */
+  questionSpec: QuestionToolSpec | null;
+  /** FASE 6 — batch question in flight: true while a `question` tool call has been emitted to
+   *  the user and its answer is awaited. `pendingQuestionToolCallId` is the STABLE id of that
+   *  call (re-emits reuse the same id → idempotent), `pendingQuestions` = the questions. The
+   *  user's answer comes back as a `tool` result and feeds the planify re-plan as `steering`. */
+  askingQuestion: boolean;
+  pendingQuestionToolCallId: string | null;
+  pendingQuestions: QuestionItem[] | null;
   /** The subagent whose result the parent is waiting for (set when a spawn ToolCall is emitted). */
   pendingAgentId: string | null;
   decision: LoopDecision | null;
@@ -125,6 +136,10 @@ export function newLoopState(args: {
     phaseResults: {},
     steering: '',
     awaitingUser: false,
+    questionSpec: null,
+    askingQuestion: false,
+    pendingQuestionToolCallId: null,
+    pendingQuestions: null,
     pendingAgentId: null,
     decision: null,
     finalOutput: '',

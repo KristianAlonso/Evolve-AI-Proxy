@@ -26,10 +26,14 @@ import type { ChatProvider } from './provider/types.js';
 import type { TraceLogger } from './logging.js';
 import type { LoopDecision, TokenUsage, ToolCall, ToolChoice, ToolDefinition, UpstreamMessage } from './types.js';
 import { mapSubagentTool } from './subagent-mapper.js';
+import { mapQuestionTool } from './question-mapper.js';
+import { buildQuestionToolCall, findQuestionAnswer, parseAskUserQuestions } from './question-tool.js';
 import { interpretRequest } from './interpreter.js';
 import { classifyEvaluation } from './evaluator.js';
 import { callWithStreaming } from './stream-helper.js';
 import {
+  ASK_USER_CONTRACT,
+  ASK_USER_CONTRACT_BATCH,
   buildEvaluateInstruction,
   buildExecuteInstruction,
   buildPhasePrompt,
@@ -37,6 +41,7 @@ import {
   COMPACT_PENDING_NOTICE,
   contextFull,
   estimatePromptTokens,
+  extractAskUser,
   goalHintForPlanify,
   INTERPRET_INSTRUCTION,
   isStructuredRejection,
@@ -71,6 +76,11 @@ export interface OrchestratorOutcome {
    * flow at the stored stage (planify, round+1, the reply captured as steering).
    */
   awaitingUser?: boolean;
+  /** kind === 'tool_call' AND the ToolCall is the client's QUESTION tool (batch mode): it
+   *  carries the pending question(s) for the USER. The answer comes back as a `tool` result
+   *  (strict `tool_call_id` match); until then the same call is re-emitted (stable id).
+   *  The session stays alive across the re-emits. */
+  askingUser?: boolean;
 }
 
 export class SubagentOrchestrator {
@@ -102,18 +112,28 @@ export class SubagentOrchestrator {
   }): Promise<{ outcome: OrchestratorOutcome; sink?: LoopSink } | null> {
     const { state, sessionId, model } = args;
 
-    const spec = await mapSubagentTool(this.provider, state.tools ?? [], {
+    // Both mappings run in parallel (independent provider calls): the subagent-spawn tool AND
+    // the question tool. The question mapping MIMICS the spawn mapping (model-based, same
+    // options shape, same null=fail-safe contract). The question tool, when present in the
+    // parent, enables BATCH questioning (several questions in one client form); without it the
+    // loop falls back to the single-question ASK_USER marker / awaiting_user flow.
+    const mapOpts = {
       model,
       logger: this.logger,
       traceId: args.traceId,
       abort_signal: args.abort_signal,
       passthrough: args.passthrough,
-    });
+    };
+    const [spec, questionSpec] = await Promise.all([
+      mapSubagentTool(this.provider, state.tools ?? [], mapOpts),
+      mapQuestionTool(this.provider, state.tools ?? [], mapOpts),
+    ]);
     if (!spec) return null;
     state.spec = spec;
+    state.questionSpec = questionSpec;
     state.activeTypeId = spec.typeId;
     state.spawnRetries = 0;
-    state.totalUpstreamCalls += 1; // the mapping call itself
+    state.totalUpstreamCalls += 2; // both mapping calls (subagent-spawn + question)
 
     // Interpret is the only phase that runs in the parent (R3). Its reasoning streams to the
     // client (R2); the structured JSON stays internal.
@@ -214,6 +234,50 @@ export class SubagentOrchestrator {
           `orchestrator resume: user steering captured (${steering.length} chars, stage=${state.stage} round=${state.round}) — next planify/evaluate will incorporate it`,
         );
       }
+    }
+
+    // PENDING QUESTION (batch mode): a `question` tool call was emitted to the user. Its
+    // answer arrives as a `tool` result (strict `tool_call_id` match, `findQuestionAnswer`).
+    // Consume it → feed the next planify as steering; re-emit stably (same id) until it
+    // arrives (idempotent — the client only runs the form once).
+    if (state.askingQuestion && state.pendingQuestionToolCallId) {
+      const answer = findQuestionAnswer(state.pendingQuestionToolCallId, incoming);
+      if (answer !== null) {
+        const n = state.pendingQuestions?.length ?? 0;
+        state.steering = answer; // the answer(s) guide the re-plan
+        state.askingQuestion = false;
+        state.pendingQuestionToolCallId = null;
+        state.pendingQuestions = null;
+        state.lastMessage = '';
+        if (incomingMessages && incomingMessages.length > 0) {
+          state.internalMessages = toInternalMessages(incomingMessages);
+        }
+        this.logger.info(
+          `orchestrator resume: user answered ${n} question(s) (${answer.length} chars) — resuming at ${state.stage} round=${state.round}`,
+        );
+        return {
+          kind: 'tool_call',
+          decision: 'tool_calls_pending',
+          usage: state.lastUsage,
+          toolCall: this.emitSpawn(state, sessionId),
+          finalOutput: '',
+        };
+      }
+      // The answer hasn't arrived yet (the client hasn't run the question form): re-emit the
+      // SAME question (stable id → idempotent). Session stays alive across re-emits.
+      const spec = state.questionSpec;
+      if (spec) {
+        return {
+          kind: 'tool_call',
+          toolCall: buildQuestionToolCall(spec, state.pendingQuestionToolCallId, state.pendingQuestions ?? []),
+          decision: 'tool_calls_pending',
+          finalOutput: '',
+          usage: state.lastUsage,
+          askingUser: true,
+        };
+      }
+      // Defensive: no spec — drop the flag and continue as a normal resume.
+      state.askingQuestion = false;
     }
 
     // AWAITING USER: the previous evaluate said the loop is blocked on user input and the
@@ -345,7 +409,56 @@ export class SubagentOrchestrator {
       if (!agentId) {
         this.logger.warn('orchestrator resume: no pending agent id — phase result missing (TTL eviction?), skipping consumption');
       } else {
-        switch (state.stage) {
+        // ASK_USER marker (IMMEDIATE user intervention): the phase itself decided it is blocked
+        // on user input — its output IS the question for the user (contract in the phase
+        // instructions, ASK_USER_CONTRACT). Surface it right away and PAUSE: no evaluate
+        // round-trip (that would cost a whole extra subagent spawn + LLM call on a question
+        // the proxy already holds). Same pause/resume transition as the evaluator's
+        // `awaiting_user` flag: stage='planify', round+1, loopState preserved — the user's
+        // reply arrives on the next parent resume and is captured as steering.
+        const askUser = extractAskUser(phaseResult ?? '');
+        if (askUser !== null) {
+          const fromStage = state.stage;
+          state.lastOutput = askUser;
+          if (fromStage === 'execute' && state.task) {
+            state.accumulatedSteps.push({
+              iteration: state.round,
+              objective: state.interpretation?.mainObjective,
+              task_id: state.task.id,
+              output: askUser,
+              successful: true,
+            });
+          }
+          const batch = state.questionSpec?.batch ? parseAskUserQuestions(askUser) : null;
+          if (batch && batch.length > 0) {
+            // BATCH (the client offers a question tool): emit the `question` tool call carrying
+            // ALL the questions at once. NOT awaiting_user — the answer comes back as a `tool`
+            // result (consumed at the top of the next resume). Do NOT early-return: the
+            // refresh-base block below still runs (lastMessage=''), and the return section
+            // emits the question ToolCall.
+            state.askingQuestion = true;
+            state.pendingQuestionToolCallId = state.pendingQuestionToolCallId ?? `q_${Date.now().toString(36)}${Math.random().toString(36).slice(2, 8)}`;
+            state.pendingQuestions = batch;
+            state.round += 1;
+            state.stage = 'planify';
+            this.logger.info(
+              `orchestrator: ${fromStage} phase asked ${batch.length} user question(s) (ASK_USER batch) — ` +
+                `emitting the question tool call (id=${state.pendingQuestionToolCallId}); ` +
+                `resuming at planify round=${state.round} after the answer`,
+            );
+          } else {
+            // SINGLE (no question tool, or plain-text question): pause with awaiting_user.
+            state.awaitingUser = true;
+            state.round += 1;
+            state.stage = 'planify';
+            this.logger.info(
+              `orchestrator: ${fromStage} phase output is a user question (ASK_USER marker) — ` +
+                `stopping IMMEDIATELY without evaluate (round=${state.round - 1}, ${askUser.length} chars); ` +
+                `the loop pauses until the user answers (next: planify round=${state.round})`,
+            );
+          }
+        } else {
+          switch (state.stage) {
           case 'planify': {
             state.task = {
               id: `task-r${state.round}`,
@@ -400,6 +513,7 @@ export class SubagentOrchestrator {
           }
           default:
             break;
+          }
         }
         // The consumed result already lives in the parent's pile (the spawn tool's result):
         // refresh the base from the incoming conversation and drop our intermediate copy.
@@ -417,6 +531,23 @@ export class SubagentOrchestrator {
         state.pendingAgentId = null;
         state.spawnRetries = 0; // a real result arrived: keep the current type (pinned for the session)
       }
+    }
+
+    // BATCH QUESTION: emit the client's `question` tool call carrying all the pending
+    // questions (one form for the user). Stable id → re-emits (resume re-entry before the
+    // answer) are idempotent; the answer arrives as a `tool` result on the next resume.
+    if (state.askingQuestion && state.questionSpec && state.pendingQuestionToolCallId && state.pendingQuestions) {
+      this.logger.info(
+        `orchestrator: emitting question tool call (id=${state.pendingQuestionToolCallId}, ${state.pendingQuestions.length} question(s), tool=${state.questionSpec.toolName})`,
+      );
+      return {
+        kind: 'tool_call',
+        toolCall: buildQuestionToolCall(state.questionSpec, state.pendingQuestionToolCallId, state.pendingQuestions),
+        decision: 'tool_calls_pending',
+        finalOutput: '',
+        usage: state.lastUsage,
+        askingUser: true,
+      };
     }
 
     // AWAITING USER: surface the question (the execute-phase output) as the client-facing
@@ -504,6 +635,7 @@ export class SubagentOrchestrator {
         instruction = buildExecuteInstruction(
           state.task?.description ?? state.originalInstruction,
           (args.tools ?? []).length > 0,
+          state.questionSpec?.batch ? 'batch' : 'single',
         );
         break;
       case 'evaluate':
@@ -660,7 +792,11 @@ export class SubagentOrchestrator {
       case 'execute':
         // Same builder as runSubagentPhase (tools=true: the execute call is the one that
         // carries the client's tools) so the estimate matches the real instruction.
-        return buildExecuteInstruction(state.task?.description ?? state.originalInstruction, true);
+        return buildExecuteInstruction(
+          state.task?.description ?? state.originalInstruction,
+          true,
+          state.questionSpec?.batch ? 'batch' : 'single',
+        );
       case 'evaluate':
         return buildEvaluateInstruction(state.originalInstruction, state.steering || undefined);
       default:
@@ -741,7 +877,8 @@ export class SubagentOrchestrator {
       case 'execute':
         return [
           state.task?.description ?? state.originalInstruction,
-          'ACCEPTANCE: DONE when the reply is exactly the raw result of performing the task (or the exact output the task asks for) and nothing else.',
+          state.questionSpec?.batch ? ASK_USER_CONTRACT_BATCH : ASK_USER_CONTRACT,
+          'ACCEPTANCE: DONE when the reply is exactly the raw result of performing the task (or the exact output the task asks for; if the task is blocked on user input, the ASK_USER payload) and nothing else.',
         ].join('\n\n');
       case 'evaluate':
         return [

@@ -18,6 +18,16 @@ import {
   type SubagentSpawnSpec,
 } from '../domain/subagent-spawn.js';
 import { mapSubagentTool } from '../domain/subagent-mapper.js';
+import { mapQuestionTool } from '../domain/question-mapper.js';
+import {
+  buildQuestionToolCall,
+  clientToolNames,
+  findQuestionAnswer,
+  parseAskUserQuestions,
+  parseQuestionSpec,
+  type QuestionToolSpec,
+} from '../domain/question-tool.js';
+import { extractAskUser } from '../domain/phase-prompts.js';
 import { SubagentOrchestrator, type OrchestratorOutcome } from '../domain/orchestrator.js';
 import { newLoopState, type LoopStateData } from '../domain/loop-state.js';
 import { stub } from './stub-provider.js';
@@ -59,6 +69,41 @@ const OTHER_TOOL: ToolDefinition = {
     parameters: { type: 'object', properties: { path: { type: 'string' } } },
   },
 };
+
+// The client's interactive question tool (OpenCode's `question`): one `questions` argument that
+// accepts an ARRAY of question objects — i.e. the client can be asked several questions at once.
+const QUESTION_TOOL: ToolDefinition = {
+  type: 'function',
+  function: {
+    name: 'question',
+    description: 'Ask the user a question (one or several at once).',
+    parameters: {
+      type: 'object',
+      properties: {
+        questions: {
+          type: 'array',
+          items: {
+            type: 'object',
+            properties: {
+              question: { type: 'string' },
+              options: { type: 'array', items: { type: 'object' } },
+            },
+            required: ['question'],
+          },
+        },
+      },
+      required: ['questions'],
+    },
+  },
+};
+
+// What the model reports for the question-tool mapping (batch-capable `question` tool).
+const QUESTION_SPEC_JSON = JSON.stringify({
+  tool: QUESTION_TOOL,
+  tool_name: 'question',
+  questions_arg: 'questions',
+  batch: true,
+});
 
 const envelope: SpawnEnvelope = {
   phase: 'planify',
@@ -332,6 +377,32 @@ function withMapping(base: ReturnType<typeof stub>, answer: string) {
   return wrapped;
 }
 
+// Routes the two MAPPING calls (subagent-spawn + question) to fixed JSON answers, and lets every
+// other call (interpret) fall through to the stub router. The question mapper is matched FIRST
+// (its system prompt says "question tool mapper", which also contains "tool mapper").
+function withBothMappings(
+  base: ReturnType<typeof stub>,
+  spawnAnswer: string,
+  questionAnswer: string,
+) {
+  const wrapped = {
+    ...base,
+    async complete(model: string | null, messages: UpstreamMessage[], options?: ProviderCallOptions): Promise<NormalizedResult> {
+      const combined = messages.map((m) => m.content ?? '').join('\n');
+      if (combined.includes('question tool mapper')) {
+        base.calls.push({ model, messages });
+        return { content: questionAnswer, reasoning: '', tool_calls: [], refused: false, finish_reason: 'stop', raw: {} };
+      }
+      if (combined.includes('tool mapper')) {
+        base.calls.push({ model, messages });
+        return { content: spawnAnswer, reasoning: '', tool_calls: [], refused: false, finish_reason: 'stop', raw: {} };
+      }
+      return base.complete(model, messages, options);
+    },
+  };
+  return wrapped;
+}
+
 function makeState(overrides: Partial<LoopStateData> = {}): LoopStateData {
   const state = newLoopState({
     originalInstruction: 'Do the thing',
@@ -387,7 +458,7 @@ describe('subagent orchestrator', () => {
     expect(state.spec).not.toBeNull();
     expect(state.activeTypeId).toBe('plan'); // pinned from spec.typeId at start
     expect(sinkCreated).toBe(true);
-    expect(state.totalUpstreamCalls).toBe(2); // mapping + interpret
+    expect(state.totalUpstreamCalls).toBe(3); // spawn-mapping + question-mapping + interpret
   });
 
   it('start(): returns null (and never creates a sink) when the mapping finds no subagent tool', async () => {
@@ -511,6 +582,53 @@ describe('subagent orchestrator', () => {
     expect(state.steering).toContain('Use the Acme brand');
     expect(state.stage).toBe('planify'); // the planify spawn is emitted (result not yet consumed)
     expect(out.toolCall!.id).toBe(`spawn_${state.pendingAgentId}`);
+  });
+
+  it('resume(): execute ASK_USER marker stops the loop IMMEDIATELY — no evaluate spawn, marker stripped, user reply resumes at planify', () => {
+    const orchestrator = new SubagentOrchestrator(stub(), log);
+    const state = makeState();
+    state.pendingAgentId = 'agent-p1';
+    state.phaseResults['agent-p1'] = JSON.stringify({ description: 'Ask the user the first grilling question' });
+
+    let out = orchestrator.resume(state, 'ses_parent_1'); // planify consumed -> spawn execute
+    expect(out.kind).toBe('tool_call');
+
+    // The execute-phase output carries the ASK_USER marker: the question IS the result.
+    state.phaseResults[state.pendingAgentId!] = 'ASK_USER: ¿Qué tipo de productos venderá esta tienda?';
+    out = orchestrator.resume(state, 'ses_parent_1');
+    // IMMEDIATE stop — the proxy did NOT spawn an evaluate for a question it already holds.
+    expect(out.kind).toBe('final');
+    expect(out.decision).toBe('awaiting_user');
+    expect(out.awaitingUser).toBe(true);
+    expect(out.finalOutput).toBe('¿Qué tipo de productos venderá esta tienda?'); // marker stripped
+    expect(state.awaitingUser).toBe(true);
+    expect(state.stage).toBe('planify'); // resume at planify (the answer may change the plan)
+    expect(state.round).toBe(2);
+    expect(state.pendingAgentId).toBeNull(); // the execute spawn was consumed — no evaluate pending
+
+    // The user answers in the parent pile -> resume at planify (steering captured).
+    state.phaseResults = {};
+    const pile: UpstreamMessage[] = [
+      { role: 'user', content: 'Do the thing', reasoning: '', tool_calls: [] },
+      { role: 'assistant', content: '', reasoning: '', tool_calls: [] },
+      { role: 'tool', tool_call_id: 'x', tool_name: 'task', content: 'plan', reasoning: '', tool_calls: [] },
+      { role: 'tool', tool_call_id: 'y', tool_name: 'task', content: 'ASK_USER: ¿Qué tipo de productos venderá esta tienda?', reasoning: '', tool_calls: [] },
+      { role: 'assistant', content: '¿Qué tipo de productos venderá esta tienda?', reasoning: '', tool_calls: [] },
+      { role: 'user', content: 'Velas artesanales', reasoning: '', tool_calls: [] },
+    ];
+    out = orchestrator.resume(state, 'ses_parent_1', pile);
+    expect(out.kind).toBe('tool_call');
+    expect(state.awaitingUser).toBe(false);
+    expect(state.steering).toContain('Velas artesanales');
+    expect(state.stage).toBe('planify');
+  });
+
+  it('extractAskUser: only a trimmed output STARTING with the marker counts (and the question is returned stripped)', () => {
+    expect(extractAskUser('ASK_USER: ¿El carrito necesita descuentos?')).toBe('¿El carrito necesita descuentos?');
+    expect(extractAskUser('  ASK_USER:   multi-word question  ')).toBe('multi-word question');
+    expect(extractAskUser('ASK_USER:')).toBeNull(); // marker with no question
+    expect(extractAskUser('Done. (ASK_USER: was not needed here)')).toBeNull(); // mid-text is NOT a signal
+    expect(extractAskUser('')).toBeNull();
   });
 
   it('resume(): missing phase result does NOT advance the stage, rotates to the next type (fresh agent id) and the result still lands', () => {
@@ -836,5 +954,184 @@ describe('subagent orchestrator', () => {
     ];
     orchestrator.resume(state2, 'ses_parent_1', blockedPile);
     expect(state2.steering).toBe('');
+  });
+});
+
+describe('question tool support (unit)', () => {
+  const qNames = ['task', 'question'];
+
+  it('parseQuestionSpec: valid spec (batch)', () => {
+    const spec = parseQuestionSpec('{"tool_name":"question","questions_arg":"questions","batch":true}', qNames);
+    expect(spec).toEqual({ toolName: 'question', questionsArg: 'questions', batch: true });
+  });
+
+  it('parseQuestionSpec: rejects none / unknown tool / missing arg / non-json / array', () => {
+    expect(parseQuestionSpec('{"none":true}', qNames)).toBeNull();
+    // Names a tool the client does not offer → null.
+    expect(parseQuestionSpec('{"tool_name":"ghost","questions_arg":"q","batch":true}', qNames)).toBeNull();
+    // No usable questions argument → null.
+    expect(parseQuestionSpec('{"tool_name":"question","batch":true}', qNames)).toBeNull();
+    // Not JSON / not an object → null.
+    expect(parseQuestionSpec('not json', qNames)).toBeNull();
+    expect(parseQuestionSpec('[]', qNames)).toBeNull();
+  });
+
+  it('buildQuestionToolCall: batch sends all questions, single sends the first only', () => {
+    const batchSpec: QuestionToolSpec = { toolName: 'question', questionsArg: 'questions', batch: true };
+    const qs = [{ question: 'What color?' }, { question: 'What size?' }];
+    const call = buildQuestionToolCall(batchSpec, 'q_abc', qs);
+    expect(call.id).toBe('q_abc');
+    expect(call.function.name).toBe('question');
+    const args = JSON.parse(call.function.arguments) as Record<string, unknown>;
+    expect((args.questions as unknown[]).length).toBe(2);
+
+    const singleSpec: QuestionToolSpec = { toolName: 'ask_user', questionsArg: 'prompt', batch: false };
+    const call2 = buildQuestionToolCall(singleSpec, 'q_1', qs);
+    const args2 = JSON.parse(call2.function.arguments) as Record<string, unknown>;
+    expect((args2.prompt as unknown[]).length).toBe(1); // only the first question
+  });
+
+  it('parseAskUserQuestions: JSON array / object-wrapped / plain text → null', () => {
+    const arr = parseAskUserQuestions('[{"question":"A?","options":[{"label":"x"}]},{"question":"B?","multiple":true}]');
+    expect(arr).toHaveLength(2);
+    expect(arr![0].question).toBe('A?');
+    expect(arr![1].multiple).toBe(true);
+
+    const obj = parseAskUserQuestions('{"questions":[{"question":"C?"}]}');
+    expect(obj).toHaveLength(1);
+    expect(obj![0].question).toBe('C?');
+
+    expect(parseAskUserQuestions('What brand should we use?')).toBeNull(); // plain text → single mode
+    expect(parseAskUserQuestions('[]')).toBeNull();
+    expect(parseAskUserQuestions('')).toBeNull();
+    expect(parseAskUserQuestions('not json')).toBeNull();
+  });
+
+  it('findQuestionAnswer: strict id match, else null', () => {
+    const msgs: UpstreamMessage[] = [
+      { role: 'user', content: 'go', reasoning: '', tool_calls: [] },
+      { role: 'tool', tool_call_id: 'q_1', tool_name: 'question', content: 'The answer', reasoning: '', tool_calls: [] },
+    ];
+    expect(findQuestionAnswer('q_1', msgs)).toBe('The answer');
+    expect(findQuestionAnswer('q_other', msgs)).toBeNull();
+    expect(findQuestionAnswer('q_x', null)).toBeNull();
+    expect(findQuestionAnswer('q_x', [])).toBeNull();
+  });
+
+  it('clientToolNames maps the tool list to names', () => {
+    expect(clientToolNames([SPAWN_TOOL, QUESTION_TOOL])).toEqual(['task', 'question']);
+  });
+});
+
+describe('question tool mapper', () => {
+  it('maps the client question tool (batch) when present', async () => {
+    const provider = withBothMappings(stub(), VALID_SPEC_JSON, QUESTION_SPEC_JSON);
+    const spec = await mapQuestionTool(provider, [SPAWN_TOOL, QUESTION_TOOL], { model: 'm', logger: log });
+    expect(spec).toEqual({ toolName: 'question', questionsArg: 'questions', batch: true });
+  });
+
+  it('returns null when the client has no question tool', async () => {
+    const provider = withBothMappings(stub(), VALID_SPEC_JSON, '{"none":true}');
+    const spec = await mapQuestionTool(provider, [SPAWN_TOOL, QUESTION_TOOL], { model: 'm', logger: log });
+    expect(spec).toBeNull();
+  });
+
+  it('returns null when the mapped tool name is not offered by the client', async () => {
+    // tool_name "ghost" is not in the client tools → parseQuestionSpec rejects it.
+    const provider = withBothMappings(stub(), VALID_SPEC_JSON, '{"tool_name":"ghost","questions_arg":"questions","batch":true}');
+    const spec = await mapQuestionTool(provider, [SPAWN_TOOL, QUESTION_TOOL], { model: 'm', logger: log });
+    expect(spec).toBeNull();
+  });
+});
+
+describe('subagent orchestrator — batch question escalation', () => {
+  it('execute ASK_USER(JSON array) -> question ToolCall -> the answer (tool result) resumes planify', async () => {
+    const provider = withBothMappings(stub(), VALID_SPEC_JSON, QUESTION_SPEC_JSON);
+    const orchestrator = new SubagentOrchestrator(provider, log);
+    const state = makeState({ tools: [SPAWN_TOOL, QUESTION_TOOL] });
+
+    const started = await orchestrator.start({
+      state,
+      sessionId: 'ses_parent_1',
+      model: 'm',
+      makeSink: () => undefined,
+    });
+    expect(started).not.toBeNull();
+    expect(started!.outcome.kind).toBe('tool_call');
+    // The question spec was mapped and is batch-capable.
+    expect(state.questionSpec).toEqual({ toolName: 'question', questionsArg: 'questions', batch: true });
+    expect(state.totalUpstreamCalls).toBe(3); // spawn-mapping + question-mapping + interpret
+
+    // planify consumed -> spawn execute.
+    state.phaseResults[state.pendingAgentId!] = JSON.stringify({ description: 'Pick the brand' });
+    let r = orchestrator.resume(state, 'ses_parent_1');
+    expect(r.kind).toBe('tool_call');
+    expect(r.toolCall!.function.name).toBe('task');
+    expect(state.stage).toBe('execute');
+
+    // The execute-phase output is a BATCH of questions for the user (ASK_USER + JSON array).
+    const execAgentId = state.pendingAgentId!;
+    state.phaseResults[execAgentId] =
+      'ASK_USER: ' +
+      JSON.stringify([
+        { question: 'What brand color?', options: [{ label: 'Red' }, { label: 'Blue' }] },
+        { question: 'How many products?', multiple: false },
+      ]);
+    r = orchestrator.resume(state, 'ses_parent_1');
+    // Must be a `question` ToolCall (NOT a spawn), and the loop paused at planify/round+1.
+    expect(r.kind).toBe('tool_call');
+    expect(r.askingUser).toBe(true);
+    expect(r.decision).toBe('tool_calls_pending');
+    expect(r.toolCall!.function.name).toBe('question');
+    const qargs = JSON.parse(r.toolCall!.function.arguments) as Record<string, unknown>;
+    expect((qargs.questions as unknown[]).length).toBe(2);
+    expect(state.askingQuestion).toBe(true);
+    expect(state.stage).toBe('planify');
+    expect(state.round).toBe(2);
+    expect(state.pendingQuestionToolCallId).toBe(r.toolCall!.id);
+
+    // The client shows the form; the answer arrives as the question tool call's `tool` result.
+    const questionId = r.toolCall!.id;
+    const answerPile: UpstreamMessage[] = [
+      { role: 'user', content: 'Do the thing', reasoning: '', tool_calls: [] },
+      {
+        role: 'assistant',
+        content: '',
+        reasoning: '',
+        tool_calls: [{ id: questionId, type: 'function', function: { name: 'question', arguments: '{}' } }],
+      },
+      { role: 'tool', tool_call_id: questionId, tool_name: 'question', content: 'Blue. 5 products.', reasoning: '', tool_calls: [] },
+    ];
+    r = orchestrator.resume(state, 'ses_parent_1', answerPile);
+    // Answer consumed -> re-emit the planify spawn (round 2) with the answer as steering.
+    expect(r.kind).toBe('tool_call');
+    expect(r.toolCall!.function.name).toBe('task');
+    expect(state.askingQuestion).toBe(false);
+    expect(state.steering).toBe('Blue. 5 products.');
+    expect(state.stage).toBe('planify');
+    expect(state.round).toBe(2);
+  });
+
+  it('re-emits the SAME question (stable id) when the answer has not arrived yet', async () => {
+    const provider = withBothMappings(stub(), VALID_SPEC_JSON, QUESTION_SPEC_JSON);
+    const orchestrator = new SubagentOrchestrator(provider, log);
+    const state = makeState({ tools: [SPAWN_TOOL, QUESTION_TOOL] });
+    await orchestrator.start({ state, sessionId: 'ses_parent_1', model: 'm', makeSink: () => undefined });
+    state.phaseResults[state.pendingAgentId!] = JSON.stringify({ description: 'Pick' });
+    orchestrator.resume(state, 'ses_parent_1'); // -> spawn execute
+    const execAgentId = state.pendingAgentId!;
+    state.phaseResults[execAgentId] = 'ASK_USER: ' + JSON.stringify([{ question: 'Color?' }]);
+    const first = orchestrator.resume(state, 'ses_parent_1'); // -> question ToolCall
+    expect(first.kind).toBe('tool_call');
+    expect(first.askingUser).toBe(true);
+    const id1 = first.toolCall!.id;
+
+    // The client has NOT run the form yet (pile = original request only, no answer).
+    const emptyPile: UpstreamMessage[] = [{ role: 'user', content: 'Do the thing', reasoning: '', tool_calls: [] }];
+    const second = orchestrator.resume(state, 'ses_parent_1', emptyPile);
+    expect(second.kind).toBe('tool_call');
+    expect(second.askingUser).toBe(true);
+    expect(second.toolCall!.id).toBe(id1); // stable id → idempotent re-emit
+    expect(state.askingQuestion).toBe(true);
   });
 });

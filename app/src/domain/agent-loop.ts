@@ -21,6 +21,7 @@ import {
   buildPlanifyInstruction,
   COMPACT_PENDING_NOTICE,
   contextFull,
+  extractAskUser,
   goalHintForPlanify,
   INTERPRET_INSTRUCTION,
   isStructuredRejection,
@@ -368,6 +369,22 @@ export class AgentLoop {
         accumulatedSteps.push(step);
         // ADR A-008: the execute output becomes the process' last intermediate message.
         this.lastMessage = result.output || null;
+
+        // ASK_USER marker (IMMEDIATE user intervention, same contract as the orchestrator): if
+        // the execute output IS a question for the user, stop right here — no evaluate
+        // round-trip. The question (marker stripped) becomes the final output; the client shows
+        // it to the user and their reply arrives as a fresh request (fresh loop, Q&A in context).
+        const askUser = extractAskUser(result.output ?? '');
+        if (askUser !== null) {
+          lastOutput = askUser;
+          this.logger.info(
+            `agent loop: execute output is a user question (ASK_USER marker) — stopping IMMEDIATELY without evaluate (round ${round + 1}, ${askUser.length} chars)`,
+          );
+          if (this.sink) this.sink.emitReasoning(round + 1, `execute is blocked on user input (immediate stop, no evaluate): ${askUser.slice(0, 200)}`);
+          trace.push({ iteration: round + 1, phase: 'executing_task', content: `ASK_USER: ${askUser.slice(0, 200)}` });
+          decision = 'awaiting_user';
+          break;
+        }
 
         // ---- Binary evaluation (SC-007/008). ----
         this.emitPhase('evaluating', { step: `evaluate #${round + 1}` });

@@ -267,14 +267,16 @@ export class ChatCompletionService {
       if (stream) {
         const sink = new ChannelSink(channel);
         if (outcome.kind === 'tool_call' && outcome.toolCall) {
-          sink.emitReasoningDelta(0, `[orchestrator] delegating phase "${session.loopState.stage} (round ${session.loopState.round})" to a subagent\n`);
+          sink.emitReasoningDelta(0, outcome.askingUser
+            ? `[orchestrator] the ${session.loopState.stage} phase has a question for the user — asking via the question tool\n`
+            : `[orchestrator] delegating phase "${session.loopState.stage} (round ${session.loopState.round})" to a subagent\n`);
           sink.emitToolCalls([outcome.toolCall]);
         } else {
           sink.emitContent(0, outcome.finalOutput);
         }
         channel.emitFinish(finishReason(outcome.decision).reason, outcome.usage ?? undefined);
         channel.endStream();
-        log.info(`request done (orchestrator resume, stream): decision=${outcome.decision} frames=${channel.frames} elapsed=${Date.now() - requestStart}ms`);
+        log.info(`request done (orchestrator resume, stream): decision=${outcome.decision}${outcome.askingUser ? ' asking_user' : ''} frames=${channel.frames} elapsed=${Date.now() - requestStart}ms`);
       } else {
         channel.sendCompletion(toOpenAICompletion(concreteModel, finalResult, traceId));
         log.info(`request done (orchestrator resume): decision=${outcome.decision} elapsed=${Date.now() - requestStart}ms`);
