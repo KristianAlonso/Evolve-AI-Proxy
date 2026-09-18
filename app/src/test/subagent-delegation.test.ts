@@ -716,4 +716,79 @@ describe('subagent orchestrator', () => {
     expect(state.totalUpstreamCalls).toBe(3);
     expect(provider.calls.length).toBe(3);
   });
+
+  it('resume(): user steering (trailing user turn past the spawn result) is captured and injected into the next planify instruction', async () => {
+    const provider = stub();
+    const orchestrator = new SubagentOrchestrator(provider, log);
+    const state = makeState();
+    state.pendingAgentId = 'agent-p1';
+    state.phaseResults['agent-p1'] = JSON.stringify({ description: 'Take a step' });
+
+    // The user stopped the client mid-run and typed a new instruction: the client appends it as
+    // a trailing user turn AFTER the spawn's tool result.
+    const pile: UpstreamMessage[] = [
+      { role: 'user', content: 'Do the thing', reasoning: '', tool_calls: [] },
+      {
+        role: 'assistant',
+        content: '',
+        reasoning: '',
+        tool_calls: [{ id: 'spawn_agent-p1', type: 'function', function: { name: 'task', arguments: '{}' } }],
+      },
+      { role: 'tool', tool_call_id: 'spawn_agent-p1', tool_name: 'task', content: 'plan result', reasoning: '', tool_calls: [] },
+      { role: 'user', content: 'Only use vanilla JS, no frameworks', reasoning: '', tool_calls: [] },
+    ];
+    const out = orchestrator.resume(state, 'ses_parent_1', pile);
+    expect(out.kind).toBe('tool_call');
+    expect(state.steering).toBe('Only use vanilla JS, no frameworks');
+    // The steering turn stays in the refreshed base (every subsequent phase sees it).
+    expect(
+      state.internalMessages.some((m) => m.role === 'user' && m.content === 'Only use vanilla JS, no frameworks'),
+    ).toBe(true);
+
+    // The next planify phase prompt carries the steering directive.
+    state.stage = 'planify';
+    state.round = 2;
+    await orchestrator.runSubagentPhase({ state, binding: { agentId: 'agent-p2', phase: 'planify' }, model: 'm' });
+    const last = provider.calls[provider.calls.length - 1].messages;
+    const instruction = last[last.length - 1].content as string;
+    expect(instruction).toContain('NEW USER DIRECTION');
+    expect(instruction).toContain('Only use vanilla JS, no frameworks');
+  });
+
+  it('resume(): NO steering on a normal pile, and the original request is never re-read as steering (blocked spawn, no tool results yet)', () => {
+    const orchestrator = new SubagentOrchestrator(stub(), log);
+
+    // Normal resume pile (ends AT the spawn's tool result) → no steering.
+    const state = makeState();
+    state.pendingAgentId = 'agent-n1';
+    state.phaseResults['agent-n1'] = JSON.stringify({ description: 'Step' });
+    const normalPile: UpstreamMessage[] = [
+      { role: 'user', content: 'Do the thing', reasoning: '', tool_calls: [] },
+      {
+        role: 'assistant',
+        content: '',
+        reasoning: '',
+        tool_calls: [{ id: 'spawn_agent-n1', type: 'function', function: { name: 'task', arguments: '{}' } }],
+      },
+      { role: 'tool', tool_call_id: 'spawn_agent-n1', tool_name: 'task', content: 'r', reasoning: '', tool_calls: [] },
+    ];
+    orchestrator.resume(state, 'ses_parent_1', normalPile);
+    expect(state.steering).toBe('');
+
+    // Blocked re-emission: the pile holds the original request + the (unanswered) spawn
+    // dispatch, NO tool results. The original request must NOT be captured as steering.
+    const state2 = makeState();
+    state2.pendingAgentId = 'agent-n2';
+    const blockedPile: UpstreamMessage[] = [
+      { role: 'user', content: 'Do the thing', reasoning: '', tool_calls: [] },
+      {
+        role: 'assistant',
+        content: '',
+        reasoning: '',
+        tool_calls: [{ id: 'spawn_agent-n2', type: 'function', function: { name: 'task', arguments: '{}' } }],
+      },
+    ];
+    orchestrator.resume(state2, 'ses_parent_1', blockedPile);
+    expect(state2.steering).toBe('');
+  });
 });

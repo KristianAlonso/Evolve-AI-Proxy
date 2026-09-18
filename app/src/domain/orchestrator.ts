@@ -31,6 +31,7 @@ import { classifyEvaluation } from './evaluator.js';
 import { callWithStreaming } from './stream-helper.js';
 import {
   buildEvaluateInstruction,
+  buildExecuteInstruction,
   buildPhasePrompt,
   buildPlanifyInstruction,
   COMPACT_PENDING_NOTICE,
@@ -39,6 +40,7 @@ import {
   goalHintForPlanify,
   INTERPRET_INSTRUCTION,
   isStructuredRejection,
+  isToolCallEcho,
   toInternalMessages,
   toRenderedMessages,
 } from './phase-prompts.js';
@@ -174,6 +176,38 @@ export class SubagentOrchestrator {
    * a second copy of a phase output (it only rides the parent's own conversation).
    */
   resume(state: LoopStateData, sessionId: string, incomingMessages?: UpstreamMessage[]): OrchestratorOutcome {
+    // USER STEERING: while a phase is running, the user can stop the client and type a new
+    // instruction. It arrives in the parent resume pile as a `user` turn appended AFTER the
+    // spawn's tool result (a non-interrupted pile always ends with that tool result, so any
+    // user turn past it is fresh user input). It is persisted in `state.steering` — injected
+    // into the next planify/evaluate instructions so the loop re-plans around the new
+    // direction — and stays in the refreshed base (internalMessages), so every subsequent
+    // phase (including execute) sees it in the conversation as well.
+    const incoming = incomingMessages ?? [];
+    if (incoming.length > 0 && !state.compactPending) {
+      // Steering = the first `user` turn that appears PAST the loop's own machinery in the
+      // pile: a tool result (the spawn's outcome) or an assistant turn carrying tool_calls (a
+      // spawn dispatch). A non-interrupted parent pile ends AT that machinery; when the user
+      // stops the run mid-flight and types a new instruction, the client appends it as a
+      // trailing user turn, and that — only that — is captured.
+      let lastActivityIdx = -1;
+      incoming.forEach((m, i) => {
+        if (m.role === 'tool' || (m.role === 'assistant' && (m.tool_calls?.length ?? 0) > 0)) lastActivityIdx = i;
+      });
+      const steering = incoming
+        .slice(lastActivityIdx + 1)
+        .filter((m) => m.role === 'user')
+        .map((m) => (typeof m.content === 'string' ? m.content : ''))
+        .map((s) => s.trim())
+        .filter(Boolean)
+        .join('\n');
+      if (steering) {
+        state.steering = steering;
+        this.logger.info(
+          `orchestrator resume: user steering captured (${steering.length} chars, stage=${state.stage} round=${state.round}) — next planify/evaluate will incorporate it`,
+        );
+      }
+    }
     if (state.stage !== 'done') {
       // Client-delegated compaction in flight: the interrupted phase's result is NOT consumed
       // (it is a pause notice, never a real output). Adopt the client's incoming pile — that is
@@ -397,13 +431,23 @@ export class SubagentOrchestrator {
     let instruction: string;
     switch (phase) {
       case 'planify':
-        instruction = buildPlanifyInstruction(goalHintForPlanify(state.originalInstruction, state.lastOutput));
+        // state.steering: the user may have typed a new direction mid-run (captured on parent
+        // resume) — the next plan MUST incorporate it.
+        instruction = buildPlanifyInstruction(
+          goalHintForPlanify(state.originalInstruction, state.lastOutput),
+          state.steering || undefined,
+        );
         break;
       case 'execute':
-        instruction = state.task?.description ?? state.originalInstruction;
+        // Imperative frame — a bare description parrots back as a plain statement (observed live:
+        // execute R1 echoed the plan and the round did nothing). See buildExecuteInstruction.
+        instruction = buildExecuteInstruction(
+          state.task?.description ?? state.originalInstruction,
+          (args.tools ?? []).length > 0,
+        );
         break;
       case 'evaluate':
-        instruction = buildEvaluateInstruction(state.originalInstruction);
+        instruction = buildEvaluateInstruction(state.originalInstruction, state.steering || undefined);
         break;
       default:
         throw new Error(`unknown delegated phase: ${phase}`);
@@ -459,6 +503,7 @@ export class SubagentOrchestrator {
     let result;
     try {
       result = await runWith(phasePrompt(state.fellBackToRendered));
+      state.totalUpstreamCalls += 1;
     } catch (err) {
       if (state.fellBackToRendered || isAbortError(err) || args.abort_signal?.aborted || !isStructuredRejection(err)) {
         throw err;
@@ -466,10 +511,24 @@ export class SubagentOrchestrator {
       state.fellBackToRendered = true;
       this.logger.warn(`subagent ${phase}: upstream rejected structured conversation — retrying rendered (sticky, agent_id=${agentId})`);
       result = await runWith(phasePrompt(true));
+      state.totalUpstreamCalls += 1;
+    }
+
+    // Planify garbage guard (observed live): the model pattern-completed the parent's `task`
+    // tool calls (visible in the structured context) and "replied" with a fake `<function=task>`
+    // text block instead of the AgentTask JSON. One-shot retry with the RENDERED base, where the
+    // tool calls are flattened to plain text (no live structured pattern to imicate) and the
+    // instruction's no-tool-calls directive does the rest. Sticky: rendered stays for the run.
+    if (phase === 'planify' && !state.fellBackToRendered && isToolCallEcho(result.content ?? '')) {
+      state.fellBackToRendered = true;
+      this.logger.warn(
+        `subagent planify: output imitated a tool call instead of AgentTask JSON — retrying rendered (sticky, agent_id=${agentId})`,
+      );
+      result = await runWith(phasePrompt(true));
+      state.totalUpstreamCalls += 1;
     }
 
     state.lastUsage = result.usage ?? null;
-    state.totalUpstreamCalls += 1;
     // Client-delegated compaction: the REAL upstream usage says the context is at/over the
     // threshold — interrupt. No phase result is stored (the next call will pre-block), and the
     // subagent receives a pause notice; the parent re-emits the pending spawn until the client
@@ -528,16 +587,22 @@ export class SubagentOrchestrator {
     return toolCall;
   }
 
-  /** The phase instruction a delegated phase would run (estimate/bookkeeping only). */
+  /** The phase instruction a delegated phase would run (estimate/bookkeeping only) — same
+   *  builders as `runSubagentPhase` so the token estimate matches the real call. */
   private phaseInstructionFor(state: LoopStateData): string {
     const stage = state.stage;
     switch (stage) {
       case 'planify':
-        return buildPlanifyInstruction(goalHintForPlanify(state.originalInstruction, state.lastOutput));
+        return buildPlanifyInstruction(
+          goalHintForPlanify(state.originalInstruction, state.lastOutput),
+          state.steering || undefined,
+        );
       case 'execute':
-        return state.task?.description ?? state.originalInstruction;
+        // Same builder as runSubagentPhase (tools=true: the execute call is the one that
+        // carries the client's tools) so the estimate matches the real instruction.
+        return buildExecuteInstruction(state.task?.description ?? state.originalInstruction, true);
       case 'evaluate':
-        return buildEvaluateInstruction(state.originalInstruction);
+        return buildEvaluateInstruction(state.originalInstruction, state.steering || undefined);
       default:
         return '';
     }

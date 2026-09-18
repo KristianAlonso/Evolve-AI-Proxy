@@ -154,6 +154,7 @@ describe('ADR A-008 — phase-prompt shaping (inline AgentLoop)', () => {
       fellBackToRendered: false,
       accumulatedSteps: [],
       phaseResults: {},
+      steering: '',
       pendingAgentId: 'ag_1',
       decision: null,
       finalOutput: '',

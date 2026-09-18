@@ -16,6 +16,7 @@ import { withAutoHealingRetry } from './safety/auto-healing-retry.js';
 import { detectDoomLoop, type DoomLoopResult } from './safety/doom-loop-detector.js';
 import {
   buildEvaluateInstruction,
+  buildExecuteInstruction,
   buildPhasePrompt,
   buildPlanifyInstruction,
   COMPACT_PENDING_NOTICE,
@@ -509,16 +510,8 @@ export class AgentLoop {
    * resumed run continues from where the delegation paused.
    */
   private buildExecuteContent(task: AgentTask, incoming: UpstreamMessage[]): string {
-    const parts: string[] = [task.description];
-    if (this.opts.tools && this.opts.tools.length > 0) {
-      parts.push(
-        [
-          'Client-side tools are available to you. If a tool is required to accomplish the task,',
-          'emit the tool call instead of plain text: the client executes it and returns the',
-          'result. Reply with plain text only when the task is complete.',
-        ].join(' '),
-      );
-    }
+    const toolsAvailable = !!(this.opts.tools && this.opts.tools.length > 0);
+    const parts: string[] = [buildExecuteInstruction(task.description, toolsAvailable)];
     const transcript = buildToolTranscript(incoming);
     if (transcript) {
       parts.push(`Tool exchange already performed by the client (keep using these results):\n${transcript}`);

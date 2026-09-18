@@ -71,6 +71,14 @@ export interface LoopStateData {
   accumulatedSteps: ContextStep[];
   /** agent_id -> last content of that subagent (the canonical phase result). */
   phaseResults: Record<string, string>;
+  /**
+   * User steering: instruction(s) the user typed while a phase was running (detected on parent
+   * resume — the trailing user turn appended to the pile past the spawn's tool result / dispatch
+   * turn). Injected into the next planify + evaluate instructions so the loop incorporates the
+   * new direction immediately; also stays in the refreshed base (internalMessages) so every
+   * subsequent phase sees it in the conversation.
+   */
+  steering: string;
   /** The subagent whose result the parent is waiting for (set when a spawn ToolCall is emitted). */
   pendingAgentId: string | null;
   decision: LoopDecision | null;
@@ -108,6 +116,7 @@ export function newLoopState(args: {
     fellBackToRendered: false,
     accumulatedSteps: [],
     phaseResults: {},
+    steering: '',
     pendingAgentId: null,
     decision: null,
     finalOutput: '',

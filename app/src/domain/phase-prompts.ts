@@ -29,6 +29,18 @@ export function goalHintForPlanify(original: string, lastOutput: string): string
   return `The goal is: "${original}". Previous attempt produced roughly: ${(lastOutput || '').slice(0, 240)}`;
 }
 
+/**
+ * Tool-call veto for the tool-less phase calls (interpret / planify / evaluate). The phase prompt
+ * carries the PARENT'S conversation — which includes the client-executed `task` spawns (assistant
+ * tool_calls + tool results) — and the phase call itself carries NO tools. A local model can
+ * pattern-complete that sequence and "emit" a tool call in plain text (e.g. a fake
+ * `<function=task>` block ending the subagent with garbage instead of the requested JSON).
+ * The veto makes the expectation explicit: history tool calls already happened; reply with JSON.
+ */
+const NO_TOOL_CALLS_DIRECTIVE =
+  'NEVER emit, imitate or reference tool calls: every tool call visible in the conversation '
+  + 'history was ALREADY executed by the client. Your reply is the JSON object and nothing else.';
+
 /** Interpretation instruction (user role, appended at the end of the conversation). */
 export const INTERPRET_INSTRUCTION = [
   'You are the interpreter of an agent loop proxy.',
@@ -37,17 +49,21 @@ export const INTERPRET_INSTRUCTION = [
   '{"mainObjective":"one sentence","subObjectives":["..."],"resourcesNeeded":["path or info to gather"]}',
   'If there are multiple aspects, subObjectives must have >= 1 item.',
   'If you cannot identify any sub-objective, say why in mainObjective and leave subObjectives empty.',
+  NO_TOOL_CALLS_DIRECTIVE,
 ].join('\n');
 
 /** Planify instruction (user role, appended at the end of the conversation). */
-export function buildPlanifyInstruction(goalHint: string): string {
+export function buildPlanifyInstruction(goalHint: string, steering?: string): string {
   return [
     'You are planning the next concrete, single action to move toward the goal.',
     '',
     `Goal hint:\n${goalHint}`,
+    steering ? '' : null,
+    steering ? `NEW USER DIRECTION (typed while the loop was running — it MUST be incorporated into the plan, overriding the previous approach where they conflict):\n${steering}` : null,
     '',
     'Reply EXACTLY with one AgentTask JSON: {"description":"<one clear sentence>"}',
-  ].join('\n');
+    NO_TOOL_CALLS_DIRECTIVE,
+  ].filter((l): l is string => l !== null).join('\n');
 }
 
 /**
@@ -55,14 +71,50 @@ export function buildPlanifyInstruction(goalHint: string): string {
  * result arrives as the assistant message immediately BEFORE this instruction (ADR A-008) — the
  * evaluator judges that message against the original instruction.
  */
-export function buildEvaluateInstruction(originalInstruction: string): string {
+export function buildEvaluateInstruction(originalInstruction: string, steering?: string): string {
   return [
     'You are the evaluator of an agent loop. Reply with ONLY JSON.',
     `Original instruction: ${originalInstruction}`,
+    steering ? `\nUpdated user direction (also applies to the goal): ${steering}` : null,
     '',
     'The assistant message immediately above is the latest result of the ongoing work.',
     'Reply with EXACTLY one of: {"complete": true} or {"complete": false}.',
-  ].join('\n');
+    NO_TOOL_CALLS_DIRECTIVE,
+  ].filter((l): l is string => l !== null).join('\n');
+}
+
+/**
+ * Execute instruction (user role, appended at the end of the conversation).
+ *
+ * The raw task description is NOT sent bare: sent as the final user turn while the SAME text
+ * already rides in the previous planify tool result, a local model parrots it verbatim ("what I
+ * was going to do") and the round ends with no work performed (observed live: execute R1 echoed
+ * the plan description, the evaluator — correctly — marked it incomplete). The imperative frame
+ * breaks the parroting: execute now, with tool calls, and do not re-plan.
+ */
+export function buildExecuteInstruction(description: string, toolsAvailable: boolean): string {
+  const lines: string[] = [
+    'You are the executor of an agent loop. EXECUTE the following task NOW — do not re-plan, '
+      + 'do not repeat or summarize the plan, do not propose what to do.',
+  ];
+  if (toolsAvailable) {
+    lines.push(
+      'Carry it out with tool calls: the client executes them and returns the results. '
+        + 'Reply with plain text only when the task is actually done.',
+    );
+  }
+  lines.push('', `Task: ${description}`, 'When done, report what was actually done and its concrete outcome.');
+  return lines.join('\n');
+}
+
+/**
+ * Detects a phase output that IMITATED a tool call in plain text instead of replying with the
+ * requested JSON — the model pattern-completes the parent's `task` tool calls visible in the
+ * context while the phase call carries no tools (XML-style `<function=...>` blocks or
+ * Anthropic-style `antml:` blocks).
+ */
+export function isToolCallEcho(content: string): boolean {
+  return /<function=|antml:invoke|antml:parameter/i.test(content);
 }
 
 /** Rough token estimate for a prompt (~4 chars per token, same heuristic as the capture interceptor). */
