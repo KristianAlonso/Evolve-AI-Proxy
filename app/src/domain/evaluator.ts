@@ -9,8 +9,11 @@ import type { TraceLogger } from './logging.js';
 const YES_PATTERNS = /(^|[\s([:punct:]])yes|true|completed|done|complete|sí|si[^l]|affirmative|correcta(?:mente)?/i;
 const NO_PATTERNS = /\bno\b|false|not complete|incomplete|no\b.*still|\bsimilar\b/i;
 
-/** Classify a raw model answer into 'complete' | 'continue'. Anything unclassifiable -> continue (SC-008). */
-export function classifyEvaluation(answer: string): { decision: 'complete' | 'continue'; normalized: string } {
+/** Classify a raw model answer into 'complete' | 'continue' | 'awaiting_user'.
+ *  Anything unclassifiable -> continue (SC-008). */
+export function classifyEvaluation(
+  answer: string,
+): { decision: 'complete' | 'continue' | 'awaiting_user'; normalized: string } {
   const clean = String(answer || '').trim().toLowerCase();
   if (!clean) return { decision: 'continue', normalized: '' };
 
@@ -24,7 +27,13 @@ export function classifyEvaluation(answer: string): { decision: 'complete' | 'co
     try {
       const parsed: unknown = JSON.parse(jsonBrace[0]);
       if (parsed !== null && typeof parsed === 'object') {
-        const v = (parsed as Record<string, unknown>).complete;
+        const rec = parsed as Record<string, unknown>;
+        // Third state: the work is BLOCKED on user input (a question was posed, a choice is
+        // needed, …). Takes priority over `complete` — the loop must surface the question and
+        // pause, never spin the next round (which would fabricate a follow-up question nobody
+        // answered). The question text is the EXECUTE output, not this JSON.
+        if (rec.awaiting_user === true) return { decision: 'awaiting_user', normalized: 'json' };
+        const v = rec.complete;
         if (typeof v === 'boolean') return { decision: v ? 'complete' : 'continue', normalized: 'json' };
         if (typeof v === 'string') {
           const s = v.trim();
@@ -58,7 +67,7 @@ export async function evaluateTask(
   messages: UpstreamMessage[],
   options?: { model: string | null; logger?: TraceLogger; traceId?: string; abort_signal?: AbortSignal; passthrough?: Record<string, unknown> },
   emitter?: LiveEmitter,
-): Promise<{ decision: 'complete' | 'continue'; reasoning: string; raw: string; streamed: boolean; usage: NormalizedResult['usage'] }> {
+): Promise<{ decision: 'complete' | 'continue' | 'awaiting_user'; reasoning: string; raw: string; streamed: boolean; usage: NormalizedResult['usage'] }> {
   const { result, streamed } = await callWithStreaming({
     provider,
     model: options?.model ?? null, // concrete user-selected model — never "auto" (no-auto rule)

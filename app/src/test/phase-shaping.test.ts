@@ -142,6 +142,7 @@ describe('ADR A-008 — phase-prompt shaping (inline AgentLoop)', () => {
       round: 1,
       max_rounds: 3,
       originalInstruction: 'Build the feature',
+      awaitingUser: false,
       internalMessages: clientMessages(),
       spec,
       activeTypeId: 'default',

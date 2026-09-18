@@ -396,7 +396,20 @@ export class AgentLoop {
             this.sink.emitReasoning(round + 1, `${evalCall.reasoning}\n-> ${evalCall.decision}`);
           }
         }
-        trace.push({ iteration: round + 1, phase: 'evaluating', content: evalCall.decision === 'complete' ? 'COMPLETE' : 'CONTINUE' });
+        trace.push({
+          iteration: round + 1,
+          phase: 'evaluating',
+          content: evalCall.decision === 'complete' ? 'COMPLETE' : evalCall.decision === 'awaiting_user' ? 'AWAITING_USER' : 'CONTINUE',
+        });
+
+        if (evalCall.decision === 'awaiting_user') {
+          // The work is blocked on user input (the latest execute output IS the question).
+          // The inline loop has no resumable persisted stage: end it with the question as the
+          // answer so the client shows it to the user; the user's reply arrives as a fresh
+          // request (fresh loop, with the Q&A in the conversation).
+          decision = 'awaiting_user';
+          break;
+        }
 
         if (evalCall.decision === 'complete') {
           decision = 'complete';

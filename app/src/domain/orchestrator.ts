@@ -64,6 +64,13 @@ export interface OrchestratorOutcome {
   finalOutput: string;
   /** Real upstream usage to relay to the client (its token tracking drives the client-side compaction). */
   usage: TokenUsage | null;
+  /**
+   * kind === 'final' AND the loop is paused waiting for the USER (the evaluator said
+   * `awaiting_user`): `finalOutput` is the question. The caller must KEEP the session /
+   * loopState alive — the user's reply arrives on the next parent resume and restarts the
+   * flow at the stored stage (planify, round+1, the reply captured as steering).
+   */
+  awaitingUser?: boolean;
 }
 
 export class SubagentOrchestrator {
@@ -208,6 +215,31 @@ export class SubagentOrchestrator {
         );
       }
     }
+
+    // AWAITING USER: the previous evaluate said the loop is blocked on user input and the
+    // question was already surfaced as the client-facing answer. The user's reply just arrived
+    // (captured as steering above, or absent — e.g. an interrupt/retry). Consume it and resume
+    // at the stored stage (planify, round+1 — the answer may change the plan). The pile now
+    // holds [ ..., tool (eval result), assistant (the question), user (the answer) ] and
+    // becomes the new base, so every subsequent phase sees the Q&A in the conversation.
+    if (state.awaitingUser) {
+      state.awaitingUser = false;
+      state.lastMessage = '';
+      if (incomingMessages && incomingMessages.length > 0) {
+        state.internalMessages = toInternalMessages(incomingMessages);
+      }
+      this.logger.info(
+        `orchestrator resume: user answered the pending question (steering=${state.steering.length} chars) — resuming at ${state.stage} round=${state.round}`,
+      );
+      return {
+        kind: 'tool_call',
+        decision: 'tool_calls_pending',
+        usage: state.lastUsage,
+        toolCall: this.emitSpawn(state, sessionId),
+        finalOutput: '',
+      };
+    }
+
     if (state.stage !== 'done') {
       // Client-delegated compaction in flight: the interrupted phase's result is NOT consumed
       // (it is a pause notice, never a real output). Adopt the client's incoming pile — that is
@@ -338,7 +370,21 @@ export class SubagentOrchestrator {
           }
           case 'evaluate': {
             const decision = classifyEvaluation(phaseResult ?? '').decision;
-            if (decision === 'complete') {
+            if (decision === 'awaiting_user') {
+              // The work is blocked on user input (a question/decision was posed to the human).
+              // Do NOT spawn planify — without the answer the next round would just fabricate
+              // a follow-up question and never stop. Surface the question (state.lastOutput,
+              // the execute-phase text) and pause with the loopState preserved; the user's
+              // reply arrives on the next parent resume and resumes at planify (round+1, the
+              // reply captured as steering).
+              state.awaitingUser = true;
+              state.round += 1;
+              state.stage = 'planify';
+              this.logger.info(
+                `orchestrator: evaluator says the loop is BLOCKED on user input — surfacing the question ` +
+                  `(round=${state.round - 1}, ${state.lastOutput.length} chars); the loop pauses until the user answers (next: ${state.stage} round=${state.round})`,
+              );
+            } else if (decision === 'complete') {
               state.decision = 'complete';
               state.stage = 'done';
               state.finalOutput = state.lastOutput;
@@ -371,6 +417,20 @@ export class SubagentOrchestrator {
         state.pendingAgentId = null;
         state.spawnRetries = 0; // a real result arrived: keep the current type (pinned for the session)
       }
+    }
+
+    // AWAITING USER: surface the question (the execute-phase output) as the client-facing
+    // answer and PAUSE — the loopState (stage='planify', round already bumped) is preserved
+    // by the caller (it re-saves the session instead of deleting it); the user's reply
+    // arrives on the next parent resume (see the block at the top of this method).
+    if (state.awaitingUser) {
+      return {
+        kind: 'final',
+        decision: 'awaiting_user',
+        finalOutput: state.lastOutput,
+        usage: state.lastUsage,
+        awaitingUser: true,
+      };
     }
 
     if (state.stage === 'done') {

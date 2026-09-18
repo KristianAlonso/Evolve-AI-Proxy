@@ -281,6 +281,11 @@ export class ChatCompletionService {
       }
       if (outcome.kind === 'tool_call' && outcome.toolCall) {
         store.save({ ...session, loopState: session.loopState, pendingToolCalls: [outcome.toolCall], updatedAt: Date.now() });
+      } else if (outcome.awaitingUser) {
+        // The loop is paused waiting for the USER (evaluator `awaiting_user`): the question
+        // above is the answer. Keep the loopState alive — the user's reply (next parent
+        // resume) resumes the flow at the stored stage.
+        store.save({ ...session, loopState: session.loopState, updatedAt: Date.now() });
       } else {
         store.delete(sessionId);
       }

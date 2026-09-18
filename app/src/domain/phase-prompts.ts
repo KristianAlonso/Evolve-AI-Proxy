@@ -78,7 +78,14 @@ export function buildEvaluateInstruction(originalInstruction: string, steering?:
     steering ? `\nUpdated user direction (also applies to the goal): ${steering}` : null,
     '',
     'The assistant message immediately above is the latest result of the ongoing work.',
-    'Reply with EXACTLY one of: {"complete": true} or {"complete": false}.',
+    'Reply with EXACTLY one of:',
+    '  {"complete": true} — the goal is fully met.',
+    '  {"complete": false} — not met, and the agent can keep working on it by itself.',
+    '  {"complete": false, "awaiting_user": true} — not met AND the work is BLOCKED on something only the',
+    '    user can provide: the latest result is a question, a request for a decision/choice, credentials,',
+    '    or any other input directed at a human. (Do NOT restate the question in the JSON — it is',
+    '    already in the latest result; just flag it.)',
+    'Do not invent a question the latest result does not contain.',
     NO_TOOL_CALLS_DIRECTIVE,
   ].filter((l): l is string => l !== null).join('\n');
 }

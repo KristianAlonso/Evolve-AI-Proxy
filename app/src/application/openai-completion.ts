@@ -24,6 +24,10 @@ export function finishReason(decision: LoopDecision): { reason: string; refused:
     // response is a normal assistant turn (a short pause notice), then the client resumes.
     case 'context_compact_pending':
       return { reason: 'stop', refused: false };
+    // The evaluator said the loop is blocked on user input: the reply IS the question (an
+    // ordinary assistant turn); the loop pauses with its state preserved for the user's answer.
+    case 'awaiting_user':
+      return { reason: 'stop', refused: false };
     default:
       return { reason: 'error', refused: true };
   }

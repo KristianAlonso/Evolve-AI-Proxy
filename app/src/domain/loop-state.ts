@@ -79,6 +79,13 @@ export interface LoopStateData {
    * subsequent phase sees it in the conversation.
    */
   steering: string;
+  /**
+   * Awaiting-user pause (evaluate returned `awaiting_user`): the loop is blocked on user input
+   * — the last execute output (the question) was already surfaced to the client as the answer.
+   * The loopState stays alive; the next parent resume (the user's reply) clears this flag, takes
+   * the reply as steering and resumes at the stored stage (planify, round+1).
+   */
+  awaitingUser: boolean;
   /** The subagent whose result the parent is waiting for (set when a spawn ToolCall is emitted). */
   pendingAgentId: string | null;
   decision: LoopDecision | null;
@@ -117,6 +124,7 @@ export function newLoopState(args: {
     accumulatedSteps: [],
     phaseResults: {},
     steering: '',
+    awaitingUser: false,
     pendingAgentId: null,
     decision: null,
     finalOutput: '',

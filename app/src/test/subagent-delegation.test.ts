@@ -467,6 +467,52 @@ describe('subagent orchestrator', () => {
     expect(state.stage).toBe('done');
   });
 
+  it('resume(): evaluator awaiting_user pauses the loop (final = the question, state preserved) and the user reply resumes at planify (round+1, steering)', () => {
+    const orchestrator = new SubagentOrchestrator(stub(), log);
+    const state = makeState();
+    state.pendingAgentId = 'agent-p1';
+    state.phaseResults['agent-p1'] = JSON.stringify({ description: 'Gather brand preferences' });
+
+    let out = orchestrator.resume(state, 'ses_parent_1'); // planify consumed -> spawn execute
+    expect(out.kind).toBe('tool_call');
+
+    // The execute-phase output IS the question posed to the human.
+    state.phaseResults[state.pendingAgentId!] = 'What brand should we use?';
+    out = orchestrator.resume(state, 'ses_parent_1'); // -> spawn evaluate
+    expect(out.kind).toBe('tool_call');
+    expect(state.stage).toBe('evaluate');
+
+    // The evaluator flags the question: the loop must PAUSE (final + awaitingUser), not spin
+    // to the next round and not end the flow.
+    state.phaseResults[state.pendingAgentId!] = '{"complete": false, "awaiting_user": true}';
+    out = orchestrator.resume(state, 'ses_parent_1');
+    expect(out.kind).toBe('final');
+    expect(out.decision).toBe('awaiting_user');
+    expect(out.awaitingUser).toBe(true);
+    expect(out.finalOutput).toBe('What brand should we use?');
+    expect(state.awaitingUser).toBe(true);
+    expect(state.stage).toBe('planify'); // resume at planify (the answer may change the plan)
+    expect(state.round).toBe(2);
+
+    // The user answers in the parent pile: [ ..., tool (eval JSON), assistant (question), user (answer) ].
+    // The steering detector must capture the answer; the resume must re-emit the planify spawn.
+    state.phaseResults = {};
+    const pile: UpstreamMessage[] = [
+      { role: 'user', content: 'Do the thing', reasoning: '', tool_calls: [] },
+      { role: 'assistant', content: '', reasoning: '', tool_calls: [] },
+      { role: 'tool', tool_call_id: 'x', tool_name: 'task', content: 'plan', reasoning: '', tool_calls: [] },
+      { role: 'tool', tool_call_id: 'y', tool_name: 'task', content: '{"complete": false, "awaiting_user": true}', reasoning: '', tool_calls: [] },
+      { role: 'assistant', content: 'What brand should we use?', reasoning: '', tool_calls: [] },
+      { role: 'user', content: 'Use the Acme brand', reasoning: '', tool_calls: [] },
+    ];
+    out = orchestrator.resume(state, 'ses_parent_1', pile);
+    expect(out.kind).toBe('tool_call');
+    expect(state.awaitingUser).toBe(false);
+    expect(state.steering).toContain('Use the Acme brand');
+    expect(state.stage).toBe('planify'); // the planify spawn is emitted (result not yet consumed)
+    expect(out.toolCall!.id).toBe(`spawn_${state.pendingAgentId}`);
+  });
+
   it('resume(): missing phase result does NOT advance the stage, rotates to the next type (fresh agent id) and the result still lands', () => {
     const orchestrator = new SubagentOrchestrator(stub(), log);
     const state = makeState();

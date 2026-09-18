@@ -141,7 +141,12 @@ export type LoopDecision =
   // The context reached the compaction threshold (prompt usage >= threshold x window): the loop
   // is interrupted — no further upstream call — and the client is expected to compact its
   // conversation and resume (the proxy passes the compaction request through as-is).
-  | 'context_compact_pending';
+  | 'context_compact_pending'
+  // The evaluator says the work is BLOCKED on user input (e.g. the agent asked a clarifying
+  // question). The question is surfaced to the client as the answer and the loop pauses with
+  // its state preserved; the user's reply resumes it (FASE 6: parent resume with the answer
+  // captured as steering and a fresh planify round).
+  | 'awaiting_user';
 
 /** Options passed from the orchestrator down into a provider call. */
 export interface CallOptions {

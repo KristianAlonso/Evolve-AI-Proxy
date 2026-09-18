@@ -45,4 +45,15 @@ describe('classifyEvaluation', () => {
     // Both a yes-word and a no-word present -> ambiguous -> continue (NOT complete).
     expect(classifyEvaluation('no, still pending').decision).toBe('continue');
   });
+
+  it('classifies the awaiting_user contract (work blocked on user input)', () => {
+    expect(classifyEvaluation('{"complete": false, "awaiting_user": true}').decision).toBe('awaiting_user');
+    expect(classifyEvaluation('Blocked on a user decision:\n{"complete": false, "awaiting_user": true}').decision).toBe('awaiting_user');
+    // awaiting_user wins over complete (the contract forbids the combination, but the flag is
+    // authoritative when present).
+    expect(classifyEvaluation('{"complete": true, "awaiting_user": true}').decision).toBe('awaiting_user');
+    // Bare complete-JSON stays unchanged.
+    expect(classifyEvaluation('{"complete": false}').decision).toBe('continue');
+    expect(classifyEvaluation('{"complete": true}').decision).toBe('complete');
+  });
 });
